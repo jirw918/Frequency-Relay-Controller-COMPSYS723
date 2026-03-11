@@ -27,3 +27,4 @@ int main()
 
 
 //IOWR_ALTERA_AVALON_PIO_DATA(BASE_ADDRESS, value)
+// IORD_ALTERA_AVALON_PIO_DATA(BASE_ADDRESS) => for gpio read.
