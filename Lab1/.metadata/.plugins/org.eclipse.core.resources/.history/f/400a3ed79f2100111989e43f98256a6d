@@ -111,11 +111,11 @@ int main(void)
 
 
 	//Lab 1 task one code
-//	xTaskCreate(counter_task, "counter_task", TASK_STACKSIZE, NULL, 16, NULL);
+	xTaskCreate(counter_task, "counter_task", TASK_STACKSIZE, NULL, 16, NULL);
 
 	//Lab 1 Task two code
-	xTaskCreate(lcd_task1,"lcd_task1",TASK_STACKSIZE,NULL,lcd_task1_priority,NULL);
-	xTaskCreate (lcd_task2,"lcd_task2",TASK_STACKSIZE,NULL,lcd_task2_priority,NULL);
+//	xTaskCreate(lcd_task1,"lcd_task1",TASK_STACKSIZE,NULL,lcd_task1_priority,NULL);
+//	xTaskCreate (lcd_task2,"lcd_task2",TASK_STACKSIZE,NULL,lcd_task2_priority,NULL);
 
 
 	/* Finally start the scheduler. */

@@ -11339,7 +11339,10 @@ int main(void)
     52f8:	0001e840 	call	1e84 <xQueueCreateCountingSemaphore>
     52fc:	d0a03415 	stw	r2,-32560(gp)
 
-	//xTaskCreate(counter_task, "counter_task", TASK_STACKSIZE, NULL, 16, NULL);
+	//Lab 1 task one code
+//	xTaskCreate(counter_task, "counter_task", TASK_STACKSIZE, NULL, 16, NULL);
+
+	//Lab 1 Task two code
 	xTaskCreate(lcd_task1,"lcd_task1",TASK_STACKSIZE,NULL,lcd_task1_priority,NULL);
     5300:	d8000315 	stw	zero,12(sp)
     5304:	d8000215 	stw	zero,8(sp)
