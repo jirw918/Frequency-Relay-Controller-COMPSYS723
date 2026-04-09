@@ -1,0 +1,47 @@
+
+#include <stdio.h>
+#include <unistd.h>
+
+#include "system.h"
+#include "sys/alt_irq.h"
+#include "io.h"
+#include "altera_avalon_pio_regs.h"
+
+#include "freertos/FreeRTOS.h"
+#include "FreeRTOS/queue.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/timers.h"
+
+// Definition of Task Stacks
+#define   TASK_STACKSIZE       2048
+
+
+// Definition of Task priorities
+#define FREQ_ANALYSER_PRIORITY 12
+
+#define MSG_QUEUE_SIZE sizeof( uint32_t)
+
+// initial code for measuring the frequency. change it later accordingly
+void freq_relay(){
+	//adc count between 2 peaks
+	unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
+	printf("%f Hz\n", 16000/(double)temp);
+	return;
+}
+
+int initCreateTask(void){
+	xTaskCreate( freq_analyser, "freq_analyser", TASK_STACKSIZE, NULL, FREQ_ANALYSER_PRIORITY, NULL );
+}
+//blink the led while printing the frequecncy
+//int main()
+//{
+//	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
+//	while(1){
+//	  IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0x55);
+//	  usleep(1000000);
+//	  IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0xaa);
+//	  usleep(1000000);
+//	}
+//
+//  return 0;
+//}
