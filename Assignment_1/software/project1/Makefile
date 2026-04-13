@@ -142,10 +142,16 @@ ACDS_VERSION := 18.1
 ELF := project1.elf
 
 # Paths to C, C++, and assembly source files.
-C_SRCS += hello_world.c
 C_SRCS += main.c
+C_SRCS += FreeRTOS/Source/tasks.c
+C_SRCS += FreeRTOS/Source/queue.c
+C_SRCS += FreeRTOS/Source/timers.c
+C_SRCS += FreeRTOS/Source/stream_buffer.c
+C_SRCS += FreeRTOS/Source/portable/MemMang/heap_3.c
+C_SRCS += FreeRTOS/Source/portable/GCC/NiosII/port.c
 CXX_SRCS :=
 ASM_SRCS :=
+# FreeRTOS source files
 
 
 # Path to root of object file tree.
@@ -166,7 +172,9 @@ APP_CFLAGS_UNDEFINED_SYMBOLS :=
 APP_CFLAGS_OPTIMIZATION := -O0
 APP_CFLAGS_DEBUG_LEVEL := -g
 APP_CFLAGS_WARNINGS := -Wall
-APP_CFLAGS_USER_FLAGS :=
+APP_CFLAGS_USER_FLAGS += -I./FreeRTOS/Source/include
+APP_CFLAGS_USER_FLAGS += -I./FreeRTOS/Source/portable/GCC/NiosII
+APP_CFLAGS_USER_FLAGS += -I./FreeRTOS
 
 APP_ASFLAGS_USER :=
 APP_LDFLAGS_USER :=

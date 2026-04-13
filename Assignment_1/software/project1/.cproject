@@ -12,6 +12,11 @@
 							<targetPlatform id="altera.nios2.mingw.gcc4.886750048" name="Nios II" superClass="altera.nios2.mingw.gcc4"/>
 							<builder buildPath="${workspace_loc://project1}" id="altera.tool.gnu.builder.mingw.1361543296" keepEnvironmentInBuildfile="false" managedBuildOn="false" name="Gnu Make Builder" superClass="altera.tool.gnu.builder.mingw"/>
 							<tool id="altera.tool.gnu.c.compiler.mingw.1020409385" name="Nios II GCC C Compiler" superClass="altera.tool.gnu.c.compiler.mingw">
+								<option id="gnu.c.compiler.option.include.paths.1109420284" superClass="gnu.c.compiler.option.include.paths" valueType="includePath">
+									<listOptionValue builtIn="false" value="&quot;../${workspace_loc:/project1/FreeRTOS/Source/include}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;../${workspace_loc:/project1/FreeRTOS/Source/portable/GCC/NiosII}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;../ ${workspace_loc:/project1/FreeRTOS}&quot;"/>
+								</option>
 								<inputType id="cdt.managedbuild.tool.gnu.c.compiler.input.83904114" superClass="cdt.managedbuild.tool.gnu.c.compiler.input"/>
 							</tool>
 							<tool id="altera.tool.gnu.cpp.compiler.mingw.1538307718" name="Nios II GCC C++ Compiler" superClass="altera.tool.gnu.cpp.compiler.mingw">
@@ -80,4 +85,5 @@
 			</target>
 		</buildTargets>
 	</storageModule>
+	<storageModule moduleId="refreshScope"/>
 </cproject>
