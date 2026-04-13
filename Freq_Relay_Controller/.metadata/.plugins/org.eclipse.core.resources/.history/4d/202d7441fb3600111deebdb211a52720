@@ -1,0 +1,55 @@
+/*
+ * main.c
+ *
+ *  Created on: 13/04/2026
+ *      Author: jevaa
+ */
+
+
+/* Standard includes. */
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Scheduler includes. */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+//Altera includes
+#include "altera_avalon_pio_regs.h"
+
+// Definition of Task Stacks
+#define   TASK_STACKSIZE       2048
+
+volatile uint8_t systemState = 0;
+/*
+ * Create the demo tasks then start the scheduler.
+ */
+
+void vSwitchPoll(){
+	unsigned  int uiSwitchValue = 0;
+	while(1){
+		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+
+		printf("%d\n", uiSwitchValue);
+		vTaskDelay(100);
+	}
+}
+
+
+
+int main(void)
+{
+	printf("Hello\n");
+
+	xTaskCreate(vSwitchPoll, "keypoll", TASK_STACKSIZE, NULL, 1, NULL);
+	/* Finally start the scheduler. */
+	vTaskStartScheduler();
+
+	/* Will only reach here if there is insufficient heap available to start
+	 the scheduler. */
+	for (;;);
+}
+
+

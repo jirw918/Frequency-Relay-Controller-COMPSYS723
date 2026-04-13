@@ -1,0 +1,167 @@
+/*
+ * main.c
+ *
+ *  Created on: 13/04/2026
+ *      Author: jevaa
+ */
+
+
+/* Standard includes. */
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Scheduler includes. */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+//Altera includes
+#include "altera_avalon_pio_regs.h"
+#include "alt_types.h"                 	// alt_u32 is a kind of alt_types
+#include "sys/alt_irq.h"              	// to register interrupts
+
+// Definition of Task Stacks
+#define   TASK_STACKSIZE       2048
+
+//global variable definition
+volatile int systemState = 0;
+volatile int buttonValue = 0;
+volatile unsigned  int uiSwitchValue = 0;
+volatile int loadState;
+
+//global variable semaphores
+SemaphoreHandle_t systemStateSem = NULL;
+
+
+void vInitSemaphores() {
+	systemStateSem = xSemaphoreCreateBinary();
+	    if (systemStateSem != NULL) {
+	        xSemaphoreGive(systemStateSem);
+	    }
+}
+
+/* Interrupt defines */
+void button_interrupts_function(void* context, alt_u32 id)
+{
+  // need to cast the context first before using it
+  int* temp = (int*) context;
+  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+
+  // clears the edge capture register
+  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+  xSemaphoreGive(systemStateSem);
+}
+
+//init interrupts
+
+
+void vSwitchPoll(){
+	while(1){
+		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+
+		printf("%d\n", uiSwitchValue);
+		printf("butoon %d\n", buttonValue);
+		vTaskDelay(200);
+	}
+}
+
+void vPrintAlive(){
+	while(1){
+		printf("da dump\n");
+		vTaskDelay(1000);
+	}
+
+}
+
+void vCheckButtonTask(){
+
+	while(1){
+		xSemaphoreTake(systemStateSem, portMAX_DELAY);
+
+		switch(buttonValue){
+		case 0:
+			break;
+		case 1:
+			if(systemState == 2){
+								systemState = 0;
+							} else {
+								systemState = 2;
+							}
+			break;
+		case 2:
+			if(systemState == 1){systemState = 0;}else{systemState = 1;}
+			break;
+		case 4:
+			if(systemState == 0){systemState = 0;}else{systemState = 0;}
+			break;
+	}
+
+		IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, systemState);
+		buttonValue = 0;
+
+			vTaskDelay(200);
+	}
+}
+
+void vLoadControlTask(){
+	while(1){
+		switch(systemState){
+			case 0:
+				//System in normal, the swithces control the loads.
+				loadState = uiSwitchValue;
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, loadState);
+				break;
+			case 1:
+				//Managing where Relay sheds the loads, swtiches can only turn off the loads.
+				if(uiSwitchValue < loadState){
+					loadState = uiSwitchValue;
+				}
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, loadState);
+				break;
+			case 2:
+				//Maintanence where only the switches control the loads, and
+				loadState = uiSwitchValue;
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, loadState);
+				break;
+			}
+
+		vTaskDelay(100);
+	}
+}
+
+int main(void)
+{
+	printf("Hello\n");
+
+	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, 262144);
+
+
+	vInitSemaphores();
+
+	  // clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
+	  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+	  // enable interrupts for all buttons
+	  IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
+
+	  // register the ISR
+	  alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
+
+	//Create Tasks
+	xTaskCreate(vLoadControlTask, "Load Control", TASK_STACKSIZE, NULL, 2, NULL);
+	xTaskCreate(vCheckButtonTask, "check button", TASK_STACKSIZE, NULL, 1, NULL);
+	xTaskCreate(vSwitchPoll, "keypoll", TASK_STACKSIZE, NULL, 1, NULL);
+	xTaskCreate(vPrintAlive, "Alive", TASK_STACKSIZE, NULL, 1, NULL);
+
+	/* Finally start the scheduler. */
+	vTaskStartScheduler();
+
+	/* Will only reach here if there is insufficient heap available to start
+	 the scheduler. */
+	for (;;);
+}
+
+

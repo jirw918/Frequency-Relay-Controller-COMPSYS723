@@ -1,0 +1,56 @@
+/*
+ * main.c
+ *
+ *  Created on: 13/04/2026
+ *      Author: jevaa
+ */
+
+
+/* Standard includes. */
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Scheduler includes. */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+volatile uint8_t systemState = 0;
+/*
+ * Create the demo tasks then start the scheduler.
+ */
+
+void vKeyZeroPoll(){
+	uint8_t key_val = 0;
+	while(1){
+		key_val = IORD_ALTERA_AVALON_PIO_DATA(PUSH_BUTTON_BASE);
+		if(key_val & 0x1){
+			if(systemState == 0){
+				systemState = 2;
+			}
+			else if(systemState == 2){
+				systemState = 0;
+			}
+		}
+
+		printf("SystemState %d\n", systemState);
+		vTaskDelay(100);
+	}
+}
+
+
+
+int main(void)
+{
+	printf("Hello\n");
+
+	/* Finally start the scheduler. */
+	vTaskStartScheduler();
+
+	/* Will only reach here if there is insufficient heap available to start
+	 the scheduler. */
+	for (;;);
+}
+
+
