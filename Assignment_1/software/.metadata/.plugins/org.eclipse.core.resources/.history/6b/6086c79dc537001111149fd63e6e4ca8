@@ -7,7 +7,6 @@
 #include "FreeRTOS/FreeRTOS.h"
 #include "FreeRTOS/task.h"
 #include "FreeRTOS/queue.h"
-#include "FreeRTOS/semphr.h"
 
 // Altera includes
 #include <sys/alt_irq.h>
@@ -16,11 +15,11 @@
 
 // globals
 static QueueHandle_t rawFreqData;
-static SemaphoreHandle_t freqMutex;
+SemaphoreHandle_t sharedFreq;
+SemaphoreHandle_t sharedROC;
+SemaphoreHandle_t sharedPrevFreq;
 
 static double prevFreq = 0;
-double freq;
-double ROC;
 
 // ISR
 
@@ -38,28 +37,21 @@ void FrequencyRelayISR(void* context, alt_u32 id)
 void FrequencyAnalysisTask(void *pvParameters)
 {
     int rawFreqValue;
-    double localFreq;
-    double localROC;
+    double freq;
+    double roc;
 
     while(1)
     {
         // Wait for data to arrive in the queue
         if (xQueueReceive(rawFreqData, &rawFreqValue, portMAX_DELAY) == pdTRUE)
         {
-            localFreq = 16000.0 / (double)rawFreqValue;
+            freq = 16000.0 / (double)rawFreqValue;
 
-            localROC = (localFreq - prevFreq) / (double)rawFreqValue + 10;
-            printf("Frequency: %.3f Hz | RoC: %.3f Hz/s\n", localFreq, localROC);
+            roc = (freq - prevFreq) / (double)rawFreqValue + 10;
+            printf("Frequency: %.3f Hz | RoC: %.3f Hz/s\n", freq, roc);
 
-            prevFreq = localFreq;
+            prevFreq = freq;
         }
-
-        xSemaphoreTake(freqMutex, portMAX_DELAY);
-
-        freq = localFreq;
-        ROC = localROC;
-
-        xSemaphoreGive(freqMutex);
     }
 }
 
@@ -68,8 +60,6 @@ void FrequencyAnalysisTask(void *pvParameters)
 void SetUpMisc(void)
 {
     rawFreqData = xQueueCreate(2, sizeof(unsigned int)); // Create the queue
-
-    freqMutex = xSemaphoreCreateMutex();
 
 }
 

@@ -7,7 +7,6 @@
 #include "FreeRTOS/FreeRTOS.h"
 #include "FreeRTOS/task.h"
 #include "FreeRTOS/queue.h"
-#include "FreeRTOS/semphr.h"
 
 // Altera includes
 #include <sys/alt_irq.h>
@@ -54,7 +53,7 @@ void FrequencyAnalysisTask(void *pvParameters)
             prevFreq = localFreq;
         }
 
-        xSemaphoreTake(freqMutex, portMAX_DELAY);
+        xSemaphoreTake(freqMutex);
 
         freq = localFreq;
         ROC = localROC;

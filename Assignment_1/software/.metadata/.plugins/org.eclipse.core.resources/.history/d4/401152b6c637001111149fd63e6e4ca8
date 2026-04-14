@@ -59,7 +59,7 @@ void FrequencyAnalysisTask(void *pvParameters)
         freq = localFreq;
         ROC = localROC;
 
-        xSemaphoreGive(freqMutex);
+        xSemaphoreGive(freqMutex. portMAX_DELAY);
     }
 }
 
