@@ -1,0 +1,111 @@
+// Standard includes
+#include <system.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// FreeRTOS includes
+#include "FreeRTOS/FreeRTOS.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/queue.h"
+#include "FreeRTOS/semphr.h"
+
+// Altera includes
+#include <sys/alt_irq.h>
+#include <alt_types.h>
+#include <altera_avalon_pio_regs.h>
+
+// globals
+
+static QueueHandle_t rawFreqData;
+static SemaphoreHandle_t freqSemaphore;
+
+static double prevFreq = 0;
+
+// ISR
+
+/* Frequency hardware interrupt */
+void FrequencyRelayISR(void* context, alt_u32 id)
+{
+    unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
+
+    xQueueSendToBackFromISR(rawFreqData, &temp, pdFALSE);
+    xSemaphoreGiveFromISR(freqSemaphore, pdTRUE);
+}
+
+// TASK
+
+void FrequencyAnalysisTask(void *pvParameters){
+	int rawFreqValue;
+	double freq;
+	double roc;
+
+	while(1){
+		xSemaphoreTake(freqSemaphore, portMAX_DELAY);
+
+	}
+}
+
+//static void FrequencyAnalysisTask(void *pvParameters)
+//{
+//    int rawFreqValue;
+//    double freq;
+//    double roc;
+//
+//    while (1)
+//    {
+//        /* Wait for new frequency sample */
+//        xSemaphoreTake(freqSemaphore, portMAX_DELAY);
+//
+//        if (xQueueReceive(rawFreqData, &rawFreqValue, 0) == pdPASS)
+//        {
+//            /* Convert raw value to frequency */
+//            freq = 16000.0 / (double)rawFreqValue;
+//
+//            /* Rate of change */
+//            roc = freq - prevFreq;
+//
+//            prevFreq = freq;
+//
+//            /* Print to terminal */
+//            printf("Frequency: %.3f Hz | RoC: %.3f Hz/s\n",
+//                   freq, roc);
+//        }
+//    }
+//}
+
+/* ===================== SETUP ===================== */
+
+void SetUpMisc(void)
+{
+    rawFreqData = xQueueCreate(10, sizeof(unsigned int));
+    freqSemaphore = xSemaphoreCreateBinary();
+}
+
+void SetUpISRs(void)
+{
+    /* Register frequency interrupt */
+    alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, FrequencyRelayISR);
+}
+
+void SetUpTasks(void)
+{
+    xTaskCreate(FrequencyAnalysisTask,
+                "FreqAnalysis",
+                configMINIMAL_STACK_SIZE,
+                NULL,
+                2,
+                NULL);
+
+    vTaskStartScheduler();
+}
+
+/* ===================== MAIN ===================== */
+
+int main(void)
+{
+    SetUpMisc();
+    SetUpISRs();
+    SetUpTasks();
+
+    while (1);
+}
