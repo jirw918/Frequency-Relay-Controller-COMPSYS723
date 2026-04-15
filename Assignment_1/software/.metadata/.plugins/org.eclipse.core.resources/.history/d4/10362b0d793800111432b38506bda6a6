@@ -1,0 +1,205 @@
+// Standard includes
+#include <system.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+// FreeRTOS includes
+#include "FreeRTOS/FreeRTOS.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/queue.h"
+#include "FreeRTOS/semphr.h"
+#include "freertos/portmacro.h"
+
+// Altera includes
+#include "sys/alt_irq.h"
+#include "alt_types.h"
+#include "altera_avalon_pio_regs.h"
+#include "altera_up_avalon_video_character_buffer_with_dma.h"
+#include "altera_up_avalon_video_pixel_buffer_dma.h"
+#include "altera_up_avalon_ps2.h"
+
+
+#define TASK_STACKSIZE 2048
+
+// globals
+static QueueHandle_t rawFreqData;
+static SemaphoreHandle_t freqMutex;
+SemaphoreHandle_t systemStateSem = NULL;
+
+
+static double prevFreq = 0;
+double freq;
+double ROC;
+volatile int systemState = 0;
+volatile int buttonValue = 0;
+volatile unsigned  int uiSwitchValue = 0;
+volatile int loadState;
+
+
+// ISRs
+
+// Frequency hardware interrupt
+void FrequencyRelayISR(void* context, alt_u32 id)
+{
+    unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
+    printf("%d", temp);
+    xQueueSendToBackFromISR(rawFreqData, &temp, pdFALSE); // Send data to the queue
+}
+// Button interrupt
+void button_interrupts_function(void* context, alt_u32 id)
+{
+  // need to cast the context first before using it
+  int* temp = (int*) context;
+  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+
+  // clears the edge capture register
+  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(systemStateSem, &xHigherPriorityTaskWoken);
+  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+}
+
+// TASKS
+
+// calculate the frequency and the rate of change of frequency
+void FrequencyAnalysisTask(void *pvParameters)
+{
+    int rawFreqValue;
+    double localFreq;
+    double localROC;
+
+    while(1)
+    {
+        // Wait for data to arrive in the queue
+        if (xQueueReceive(rawFreqData, &rawFreqValue, portMAX_DELAY) == pdTRUE)
+        {
+            localFreq = 16000.0 / (double)rawFreqValue;
+
+            localROC = (localFreq - prevFreq) / (double)rawFreqValue;
+            printf("Frequency: %.3f Hz | RoC: %.3f Hz/s\n", localFreq, localROC);
+
+            prevFreq = localFreq;
+        }
+
+        xSemaphoreTake(freqMutex, portMAX_DELAY);
+
+        freq = localFreq;
+        ROC = localROC;
+
+        xSemaphoreGive(freqMutex);
+    }
+}
+
+void vCheckButtonTask(){
+
+	while(1){
+
+		// Triggered by the button
+		xSemaphoreTake(systemStateSem, portMAX_DELAY);
+
+		// Switch between Normal, Managing, and Maintenance states
+		// MISSING : MAINTENANCE -> NORMAL ?
+		// ADD FREQUENY AND ROC ENABLED STATE CHANGE
+		switch(buttonValue){
+		case 0:
+			break;
+		case 1:
+			if(systemState == 2){systemState = 0;}else{systemState = 2;}
+			break;
+		case 2:
+			if(systemState == 1){systemState = 0;}else{systemState = 1;}
+			break;
+		case 4:
+			if(systemState == 0){systemState = 0;}else{systemState = 0;}
+			break;
+	}
+
+		// Display the current state using the LEDs
+		if(systemState == 2){IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE,  2);}
+		if(systemState == 1){IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE,  4);}
+		if(systemState == 0){IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE,  8);}
+		buttonValue = 0;
+
+			vTaskDelay(pdMS_TO_TICKS(200));
+	}
+}
+
+// Button value written to LEDs
+void vButtonHealthTask(){
+	while(1){
+
+		// MAYBE CHANGE PRIORITY TO ALLOW STATE CHANGE TO ALLOW FIRST OR INTEGRATE IT WITH THE PREVIOUS TASK
+		xSemaphoreTake(systemStateSem, portMAX_DELAY);
+		IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, buttonValue);
+	}
+}
+
+// Controls which loads to be shed
+void vLoadControlTask(){
+	while(1){
+		switch(systemState){
+			case 0:
+				//System in normal, the swithces control the loads.
+				loadState = uiSwitchValue;
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, loadState);
+				break;
+			case 1:
+				//Managing where Relay sheds the loads, swtiches can only turn off the loads.
+				if(uiSwitchValue < loadState){
+					loadState = uiSwitchValue;
+				}
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, loadState);
+				break;
+			case 2:
+				//Maintanence where only the switches control the loads, and
+				loadState = uiSwitchValue;
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, loadState);
+				break;
+			}
+
+		vTaskDelay(100);
+	}
+}
+
+// SETUP
+
+void SetUpMisc(void)
+{
+    rawFreqData = xQueueCreate(2, sizeof(unsigned int)); // Create the queue
+    freqMutex = xSemaphoreCreateMutex();
+}
+
+void SetUpISRs(void)
+{
+    // Register frequency interrupt
+   alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, FrequencyRelayISR);
+
+   //intialise the state machine semaphore
+   systemStateSem = xSemaphoreCreateBinary();
+        if (systemStateSem != NULL) {
+            xSemaphoreGive(systemStateSem);
+        }
+}
+
+void SetUpTasks(void)
+{
+    // Create the task that will process frequency data
+    xTaskCreate(FrequencyAnalysisTask, "FreqAnalysis", TASK_STACKSIZE, NULL, 2, NULL);
+    xTaskCreate(vButtonHealthTask, "Button Health", TASK_STACKSIZE, NULL, 2, NULL);
+    xTaskCreate(vCheckButtonTask, "check button", TASK_STACKSIZE, NULL, 1, NULL);
+    xTaskCreate(vLoadControlTask, "Load Control", TASK_STACKSIZE, NULL, 2, NULL);
+
+    vTaskStartScheduler(); // Start the FreeRTOS scheduler
+}
+
+int main(void)
+{
+    SetUpMisc();
+    SetUpISRs();
+    SetUpTasks();
+    return 0;
+}

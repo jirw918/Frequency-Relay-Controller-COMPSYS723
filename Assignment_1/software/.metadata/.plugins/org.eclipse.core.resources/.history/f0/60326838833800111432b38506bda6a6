@@ -1,0 +1,172 @@
+// Standard includes
+#include <system.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+// FreeRTOS includes
+#include "FreeRTOS/FreeRTOS.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/queue.h"
+#include "FreeRTOS/semphr.h"
+#include "freertos/portmacro.h"
+
+// Altera includes
+#include "sys/alt_irq.h"
+#include "alt_types.h"
+#include "altera_avalon_pio_regs.h"
+#include "altera_up_avalon_video_character_buffer_with_dma.h"
+#include "altera_up_avalon_video_pixel_buffer_dma.h"
+#include "altera_up_avalon_ps2.h"
+
+
+#define TASK_STACKSIZE 2048
+#define STATE_NORMAL      0
+#define STATE_MANAGING    1
+#define STATE_MAINTENANCE 2
+
+#define freqThreshold 49.0
+#define ROCThreshold 0.05
+
+// globals
+static QueueHandle_t rawFreqData;
+static SemaphoreHandle_t freqMutex;
+SemaphoreHandle_t systemStateSem;
+SemaphoreHandle_t thresholdSemaphore;
+
+
+static double prevFreq = 0;
+double freq;
+double ROC;
+volatile int systemState = 0;
+volatile int buttonValue = 0;
+volatile unsigned  int uiSwitchValue = 0;
+volatile int loadState;
+
+
+// ISRs
+
+// Frequency hardware interrupt
+void FrequencyRelayISR(void* context, alt_u32 id)
+{
+    unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
+    printf("%d", temp);
+    xQueueSendToBackFromISR(rawFreqData, &temp, pdFALSE); // Send data to the queue
+}
+// Button interrupt
+void button_interrupts_function(void* context, alt_u32 id)
+{
+  // need to cast the context first before using it
+  int* temp = (int*) context;
+  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+
+  // clears the edge capture register
+  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(systemStateSem, &xHigherPriorityTaskWoken);
+  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+}
+
+// TASKS
+
+// calculate the frequency and the rate of change of frequency
+void FrequencyAnalysisTask(void *pvParameters)
+{
+    int rawFreqValue;
+    double localFreq;
+    double localROC;
+
+    while(1)
+    {
+        // Wait for data to arrive in the queue
+        if (xQueueReceive(rawFreqData, &rawFreqValue, portMAX_DELAY) == pdTRUE)
+        {
+            localFreq = 16000.0 / (double)rawFreqValue;
+
+            localROC = (localFreq - prevFreq) / (double)rawFreqValue;
+            printf("Frequency: %.3f Hz | RoC: %.3f Hz/s\n", localFreq, localROC);
+
+            prevFreq = localFreq;
+        }
+
+        xSemaphoreTake(freqMutex, portMAX_DELAY);
+
+        freq = localFreq;
+        ROC = localROC;
+
+        xSemaphoreGive(freqMutex);
+
+        if(freq < freqThreshold || ROC < ROCThreshold){
+
+        	xSemaphoreTake(systemStateSem, portMAX_DELAY);
+
+        	if(systemState == 0){
+        		systemState = 1;
+        	}
+
+        	xSemaphoreGive(systemStateSem);
+
+        }
+    }
+}
+
+// Switches between Normal and Maintenance State
+void vCheckButtonTask(){
+
+	while(1){
+
+		// Triggered by the button
+		xSemaphoreTake(systemStateSem, portMAX_DELAY);
+
+		if(systemState == 0){
+			systemState = 2;
+		}
+		else if(systemState == 2){
+			systemState = 0;
+		}
+}
+
+// Controls which loads to be shed
+void vLoadControlTask(){
+
+	}
+}
+
+// SETUP
+
+void SetUpMisc(void)
+{
+    rawFreqData = xQueueCreate(2, sizeof(unsigned int)); // Create the queue
+    freqMutex = xSemaphoreCreateMutex();
+}
+
+void SetUpISRs(void)
+{
+    // Register frequency interrupt
+   alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, FrequencyRelayISR);
+
+   //intialise the state machine semaphore
+   systemStateSem = xSemaphoreCreateBinary();
+}
+
+void SetUpTasks(void)
+{
+    // Create the task that will process frequency data
+    xTaskCreate(FrequencyAnalysisTask, "FreqAnalysis", TASK_STACKSIZE, NULL, 2, NULL);
+//    xTaskCreate(vButtonHealthTask, "Button Health", TASK_STACKSIZE, NULL, 2, NULL);
+    xTaskCreate(vCheckButtonTask, "check button", TASK_STACKSIZE, NULL, 1, NULL);
+    xTaskCreate(vLoadControlTask, "Load Control", TASK_STACKSIZE, NULL, 2, NULL);
+
+    vTaskStartScheduler(); // Start the FreeRTOS scheduler
+}
+
+int main(void)
+{
+    SetUpMisc();
+    SetUpISRs();
+    SetUpTasks();
+    return 0;
+}
