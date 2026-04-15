@@ -6,6 +6,8 @@
  */
 
 
+#include "sys/alt_stdio.h"
+
 /* Standard includes. */
 #include <stddef.h>
 #include <stdio.h>
@@ -39,6 +41,147 @@ volatile int buttonValue = 0;
 volatile unsigned  int uiSwitchValue = 0;
 volatile int loadState;
 
+
+//For frequency plot *******
+
+#define FREQPLT_ORI_X 101		//x axis pixel position at the plot origin
+#define FREQPLT_GRID_SIZE_X 5	//pixel separation in the x axis between two data points
+#define FREQPLT_ORI_Y 199.0		//y axis pixel position at the plot origin
+#define FREQPLT_FREQ_RES 20.0	//number of pixels per Hz (y axis scale)
+
+#define ROCPLT_ORI_X 101
+#define ROCPLT_GRID_SIZE_X 5
+#define ROCPLT_ORI_Y 259.0
+#define ROCPLT_ROC_RES 0.5		//number of pixels per Hz/s (y axis scale)
+
+#define MIN_FREQ 45.0 //minimum frequency to draw
+
+#define PRVGADraw_Task_P      (tskIDLE_PRIORITY+1)
+TaskHandle_t PRVGADraw;
+
+static QueueHandle_t Q_freq_data;
+
+typedef struct{
+	unsigned int x1;
+	unsigned int y1;
+	unsigned int x2;
+	unsigned int y2;
+}Line;
+
+
+/****** VGA display ******/
+
+void PRVGADraw_Task(void *pvParameters ){
+
+
+	//initialize VGA controllers
+	alt_up_pixel_buffer_dma_dev *pixel_buf;
+	pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+	if(pixel_buf == NULL){
+		printf("can't find pixel buffer device\n");
+	}
+	alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
+
+	alt_up_char_buffer_dev *char_buf;
+	char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+	if(char_buf == NULL){
+		printf("can't find char buffer device\n");
+	}
+	alt_up_char_buffer_clear(char_buf);
+
+
+
+	//Set up plot axes
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 50, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 220, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+
+	alt_up_char_buffer_string(char_buf, "Frequency(Hz)", 4, 4);
+	alt_up_char_buffer_string(char_buf, "52", 10, 7);
+	alt_up_char_buffer_string(char_buf, "50", 10, 12);
+	alt_up_char_buffer_string(char_buf, "48", 10, 17);
+	alt_up_char_buffer_string(char_buf, "46", 10, 22);
+
+	alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)", 4, 26);
+	alt_up_char_buffer_string(char_buf, "60", 10, 28);
+	alt_up_char_buffer_string(char_buf, "30", 10, 30);
+	alt_up_char_buffer_string(char_buf, "0", 10, 32);
+	alt_up_char_buffer_string(char_buf, "-30", 9, 34);
+	alt_up_char_buffer_string(char_buf, "-60", 9, 36);
+
+	//CUSTOM
+
+	alt_up_char_buffer_string(char_buf, "x", 0, 0);
+	alt_up_char_buffer_string(char_buf, "a", 79, 0);
+	alt_up_char_buffer_string(char_buf, "b", 0, 59);
+	alt_up_char_buffer_string(char_buf, "c", 79, 59);
+
+	// --
+
+
+	double freq[100], dfreq[100];
+	int i = 99, j = 0;
+	Line line_freq, line_roc;
+
+	while(1){
+
+		//receive frequency data from queue
+		while(uxQueueMessagesWaiting( Q_freq_data ) != 0){
+			xQueueReceive( Q_freq_data, freq+i, 0 );
+
+			//calculate frequency RoC
+
+			if(i==0){
+				dfreq[0] = (freq[0]-freq[99]) * 2.0 * freq[0] * freq[99] / (freq[0]+freq[99]);
+			}
+			else{
+				dfreq[i] = (freq[i]-freq[i-1]) * 2.0 * freq[i]* freq[i-1] / (freq[i]+freq[i-1]);
+			}
+
+			if (dfreq[i] > 100.0){
+				dfreq[i] = 100.0;
+			}
+
+
+			i =	++i%100; //point to the next data (oldest) to be overwritten
+
+		}
+
+		//clear old graph to draw new graph
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 0, 639, 199, 0, 0);
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 201, 639, 299, 0, 0);
+
+		for(j=0;j<99;++j){ //i here points to the oldest data, j loops through all the data to be drawn on VGA
+			if (((int)(freq[(i+j)%100]) > MIN_FREQ) && ((int)(freq[(i+j+1)%100]) > MIN_FREQ)){
+				//Calculate coordinates of the two data points to draw a line in between
+				//Frequency plot
+				line_freq.x1 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * j;
+				line_freq.y1 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j)%100] - MIN_FREQ));
+
+				line_freq.x2 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * (j + 1);
+				line_freq.y2 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j+1)%100] - MIN_FREQ));
+
+				//Frequency RoC plot
+				line_roc.x1 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * j;
+				line_roc.y1 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j)%100]);
+
+				line_roc.x2 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * (j + 1);
+				line_roc.y2 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j+1)%100]);
+
+				//Draw
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_freq.x1, line_freq.y1, line_freq.x2, line_freq.y2, 0x3ff << 0, 0);
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1, line_roc.x2, line_roc.y2, 0x3ff << 0, 0);
+			}
+		}
+		vTaskDelay(10);
+
+	}
+}
+
+
+//***************************
+
 //global variable semaphores
 SemaphoreHandle_t systemStateSem = NULL;
 
@@ -51,6 +194,7 @@ void vInitSemaphores() {
 }
 
 /* Interrupt defines */
+
 void button_interrupts_function(void* context, alt_u32 id)
 {
   // need to cast the context first before using it
@@ -67,10 +211,27 @@ void button_interrupts_function(void* context, alt_u32 id)
 }
 
 
-void ps2_isr(void* ps2_device, alt_u32 id){
-	unsigned char byte;
-	alt_up_ps2_read_data_byte_timeout(ps2_device, &byte);
-	printf("Scan code: %x\n", byte);
+volatile int interrupt_count = 0;
+
+void ps2_isr(void* context, alt_u32 id)
+{
+    alt_up_ps2_dev * ps2_device = (alt_up_ps2_dev *)context;
+    unsigned char byte;
+    int status;
+
+    interrupt_count++;
+
+    // Read the scan code
+    status = alt_up_ps2_read_data_byte(ps2_device, &byte);
+
+    if(status == 0) {
+        printf("Scan code: 0x%02x\n", byte);
+    } else {
+        printf("Read failed, status: %d\n", status);
+    }
+
+    // Clear the interrupt
+    alt_up_ps2_clear_fifo(ps2_device);
 }
 
 //init interrupts
@@ -160,44 +321,12 @@ void vLoadControlTask(){
 	}
 }
 
-void vga_test_task(void *pvParameters) {
-    alt_up_char_buffer_dev *char_buf;
-
-    // Use the actual device name from your system.h
-    char_buf = alt_up_char_buffer_open_dev(
-    		VIDEO_CHARACTER_BUFFER_WITH_DMA_AVALON_CHAR_BUFFER_SLAVE_NAME
-    );
-
-    if (char_buf == NULL) {
-        // Print error if you have JTAG UART
-        printf("VGA char buffer open failed!\n");
-        vTaskDelete(NULL);
-    }
-
-    // Clear the screen
-    alt_up_char_buffer_clear(char_buf);
-
-    // Write text at various positions (x, y, string)
-    alt_up_char_buffer_string(char_buf, "FreeRTOS on Nios II", 20, 10);
-    alt_up_char_buffer_string(char_buf, "VGA Character Mode", 20, 12);
-    alt_up_char_buffer_string(char_buf, "DE2-115 Cyclone IV", 20, 14);
-
-    // Draw a box using characters
-    for (int x = 10; x < 70; x++) {
-        alt_up_char_buffer_draw(char_buf, '-', x, 8);
-        alt_up_char_buffer_draw(char_buf, '-', x, 18);
-    }
-    for (int y = 8; y < 18; y++) {
-        alt_up_char_buffer_draw(char_buf, '|', 10, y);
-        alt_up_char_buffer_draw(char_buf, '|', 69, y);
-    }
-
-    vTaskDelete(NULL);
-}
-
 int main(void)
 {
+	 alt_irq_cpu_enable_interrupts();
+
 	printf("Hello\n");
+	//alt_putstr("Test 1\n");
 
 	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, 262144);
 
@@ -213,38 +342,84 @@ int main(void)
 	  // register the ISR
 	  alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
 
+
+	//PS2 SETUP
+
+	printf("Hello\n");
+		    printf("=== PS/2 Interrupt Test ===\n");
+
+		    // Open device
+		    alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
+		    if(ps2_device == NULL){
+		        printf("ERROR: Can't open PS/2\n");
+		        return 1;
+		    }
+		    printf("PS/2 device opened at: %p\n", ps2_device);
+
+		    // Clear FIFO
+		    alt_up_ps2_clear_fifo(ps2_device);
+		    printf("FIFO cleared\n");
+
+		    // Register interrupt FIRST (before enabling)
+		    printf("Registering interrupt (IRQ %d)...\n", PS2_IRQ);
+		    int status = alt_irq_register(PS2_IRQ, (void*)ps2_device, ps2_isr);
+		    if(status != 0) {
+		        printf("ERROR: Interrupt registration failed: %d\n", status);
+		        return 1;
+		    }
+		    printf("Interrupt registered successfully\n");
+
+		    // Enable PS/2 interrupts
+		    alt_up_ps2_enable_read_interrupt(ps2_device);
+		    printf("PS/2 read interrupt enabled\n");
+
+		    // Enable global interrupts - CRITICAL!
+		    alt_irq_cpu_enable_interrupts();
+		    printf("Global CPU interrupts enabled\n");
+
+		    printf("\n>>> PLUG IN KEYBOARD AND PRESS KEYS <<<\n\n");
+
+
+		    //VGA
+
+		    Q_freq_data = xQueueCreate( 100, sizeof(double) );
+
+
+		    /*
+		    alt_up_pixel_buffer_dma_dev *pixel_buf;
+			pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+			if(pixel_buf == NULL){
+				printf("Cannot find pixel buffer device\n");
+			}
+			alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
+
+			//initialize character buffer
+			alt_up_char_buffer_dev *char_buf;
+			char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+			if(char_buf == NULL){
+				printf("can't find char buffer device\n");
+			}*/
+
 	//Create Tasks
-	//xTaskCreate(vLoadControlTask, "Load Control", TASK_STACKSIZE, NULL, 2, NULL);
-	//xTaskCreate(vCheckButtonTask, "check button", TASK_STACKSIZE, NULL, 1, NULL);
-	//xTaskCreate(vSwitchPoll, "keypoll", TASK_STACKSIZE, NULL, 1, NULL);
+	xTaskCreate( PRVGADraw_Task, "DrawTsk", configMINIMAL_STACK_SIZE, NULL, PRVGADraw_Task_P, &PRVGADraw );
+	xTaskCreate(vLoadControlTask, "Load Control", TASK_STACKSIZE, NULL, 2, NULL);
+	xTaskCreate(vCheckButtonTask, "check button", TASK_STACKSIZE, NULL, 1, NULL);
+	xTaskCreate(vSwitchPoll, "keypoll", TASK_STACKSIZE, NULL, 1, NULL);
 
 	//xTaskCreate(vButtonHealthTask, "Button Health", TASK_STACKSIZE, NULL, 2, NULL);
 	//xTaskCreate(vPrintAlive, "Alive", TASK_STACKSIZE, NULL, 1, NULL);
 	 // xTaskCreate(vga_test_task, "VGA Test", 1024, NULL, 2, NULL);
 	/* Finally start the scheduler. */
-	//vTaskStartScheduler();
+	vTaskStartScheduler();
 
-	// In main(), after vTaskStartScheduler() setup:
+
 
 	/* Will only reach here if there is insufficient heap available to start
 	 the scheduler. */
-	//for (;;);
-
-	 //PS2
-
-	  alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
-
-	  	if(ps2_device == NULL){
-	  		printf("can't find PS/2 device\n");
-	  		return 1;
-	  	}
-
-	  	alt_up_ps2_enable_read_interrupt(ps2_device);
-	  	alt_irq_register(PS2_IRQ, ps2_device, ps2_isr);
-
-
+	for (;;);
 
 	//reset the display
+/*
 		alt_up_pixel_buffer_dma_dev *pixel_buf;
 		pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
 		if(pixel_buf == NULL){
@@ -257,21 +432,23 @@ int main(void)
 		char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
 		if(char_buf == NULL){
 			printf("can't find char buffer device\n");
-		}
+		} */
 
-		while(1){
-			alt_up_char_buffer_string(char_buf, "Hello World", 40, 30);
-			usleep(1000000);
-			alt_up_char_buffer_draw(char_buf, '!', 51, 30);
-			usleep(1000000);
-			alt_up_char_buffer_string(char_buf, "Hello World", 50, 30);
-			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0xaa);
-					usleep(1000000);
-					IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0x55);
-					usleep(1000000);
-		}
 
-	  return 0;
+	    // Main loop
+	    /*int loop_count = 0;
+	    while(1){
+	        IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0xaa);
+	        usleep(500000);
+	        IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0x55);
+	        usleep(500000);
+
+	        loop_count++;
+	        if(loop_count % 5 == 0) {
+	            printf("Loop %d, Interrupts received: %d\n", loop_count, interrupt_count);
+	        }
+	    }*/
+
+	    return 0;
+
 }
-
-

@@ -1,4 +1,6 @@
-obj/default/main.o: main.c ../freq_relay_controller_bsp/system.h \
+obj/default/main.o: main.c \
+ ../freq_relay_controller_bsp//HAL/inc/sys/alt_stdio.h \
+ ../freq_relay_controller_bsp/system.h \
  ../freq_relay_controller_bsp/linker.h freertos/FreeRTOS.h \
  freertos/FreeRTOSConfig.h freertos/projdefs.h freertos/portable.h \
  freertos/deprecated_definitions.h freertos/portmacro.h \
@@ -17,6 +19,8 @@ obj/default/main.o: main.c ../freq_relay_controller_bsp/system.h \
  ../freq_relay_controller_bsp//HAL/inc/priv/alt_dev_llist.h \
  ../freq_relay_controller_bsp//drivers/inc/altera_up_avalon_video_pixel_buffer_dma.h \
  ../freq_relay_controller_bsp//drivers/inc/altera_up_avalon_ps2.h
+
+../freq_relay_controller_bsp//HAL/inc/sys/alt_stdio.h:
 
 ../freq_relay_controller_bsp/system.h:
 
