@@ -20,140 +20,191 @@
 #include "altera_up_avalon_video_pixel_buffer_dma.h"
 #include "altera_up_avalon_ps2.h"
 
-
 #define TASK_STACKSIZE 2048
+#define NUM_LOADS      5
+
 #define STATE_NORMAL      0
 #define STATE_MANAGING    1
 #define STATE_MAINTENANCE 2
 
-#define freqThreshold 49.0
-#define ROCThreshold 0.05
+#define FREQ_THRESHOLD  49.0
+#define ROC_THRESHOLD   10
 
-// globals
+// --- Globals ---
 static QueueHandle_t rawFreqData;
 static SemaphoreHandle_t freqMutex;
+static SemaphoreHandle_t stateMutex;
+static SemaphoreHandle_t loadMutex;
 SemaphoreHandle_t buttonSem;
-SemaphoreHandle_t thresholdSem;
-SemaphoreHandle_t stateMutex;
 SemaphoreHandle_t loadSem;
 
-static double prevFreq = 0;
-double freq;
-double ROC;
-volatile int systemState = 0;
-volatile int buttonValue = 0;
-volatile unsigned  int uiSwitchValue = 0;
-volatile int loadState;
+static double prevFreq   = 0.0;
+static double freq       = 0.0;
+static double ROC        = 0.0;
+volatile int  systemState = STATE_NORMAL;
 
+/*
+ * loadEnabled[i]  – user's switch intent: 1 = user wants load ON, 0 = user wants it OFF
+ * loadRelayOn[i]  – relay's decision:     1 = relay allows load ON, 0 = relay has shed it
+ *
+ * Actual load state = loadEnabled[i] && loadRelayOn[i]
+ * Red  LED i = actual load ON
+ * Green LED i = relay shed it (loadRelayOn[i]==0 while load was ON)
+ */
+static int loadEnabled[NUM_LOADS];   // controlled by slide switches
+static int loadRelayOn[NUM_LOADS];   // controlled by relay logic (all 1 at start)
+static int loadShedByRelay[NUM_LOADS]; // 1 if relay has shed this load
+
+// Helpers
+
+// Returns 1 if network is currently unstable
+static int isUnstable(double f, double roc)
+{
+    return (f < FREQ_THRESHOLD) || (fabs(roc) > ROC_THRESHOLD);
+}
+
+// Update physical LEDs from load state (call while holding loadMutex)
+static void updateLEDs(void)
+{
+    unsigned int redMask   = 0;
+    unsigned int greenMask = 0;
+
+    //
+    for (int i = 0; i < NUM_LOADS; i++) {
+        int actualOn = loadEnabled[i] && loadRelayOn[i];
+        if (actualOn) {
+            redMask |= (1 << i);
+        }
+        // Green LED lights if relay shed a load that the user still wants on
+        if (loadShedByRelay[i] && loadEnabled[i]) {
+            greenMask |= (1 << i);
+        }
+    }
+    IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE,   redMask);
+    IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, greenMask);
+
+// Debug
+//    printf("RED: %x | GREEN: %x\n", redMask, greenMask);
+}
+
+// Shed the lowest-priority load that is currently ON (returns 1 if one was shed)
+static int shedLowestPriorityLoad(void)
+{
+    xSemaphoreTake(loadMutex, portMAX_DELAY);
+    for (int i = 0; i < NUM_LOADS; i++) {          // i=0 is lowest priority
+        if (loadEnabled[i] && loadRelayOn[i]) {
+            loadRelayOn[i]    = 0;
+            loadShedByRelay[i] = 1;
+            updateLEDs();
+            xSemaphoreGive(loadMutex);
+            printf("Relay SHED load %d\n", i);
+            return 1;
+        }
+    }
+    xSemaphoreGive(loadMutex);
+    return 0;  // nothing left to shed
+}
+
+// Reconnect the highest-priority load that was shed (returns 1 if one was reconnected)
+static int reconnectHighestPriorityLoad(void)
+{
+    xSemaphoreTake(loadMutex, portMAX_DELAY);
+    for (int i = NUM_LOADS - 1; i >= 0; i--) {    // i=NUM_LOADS-1 is highest priority
+        if (loadShedByRelay[i]) {
+            loadRelayOn[i]    = 1;
+            loadShedByRelay[i] = 0;
+            updateLEDs();
+            xSemaphoreGive(loadMutex);
+            printf("Relay RECONNECTED load %d\n", i);
+            return 1;
+        }
+    }
+    xSemaphoreGive(loadMutex);
+    return 0;  // nothing shed, all reconnected
+}
+
+// Returns 1 if all shed loads have been reconnected
+static int allLoadsReconnected(void)
+{
+    for (int i = 0; i < NUM_LOADS; i++) {
+        if (loadShedByRelay[i]) return 0;
+    }
+    return 1;
+}
 
 // ISRs
 
-// Frequency hardware interrupt
 void FrequencyRelayISR(void* context, alt_u32 id)
 {
     unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
-    printf("%d", temp);
-    xQueueSendToBackFromISR(rawFreqData, &temp, pdFALSE); // Send data to the queue
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendToBackFromISR(rawFreqData, &temp, &xHigherPriorityTaskWoken);
+    portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
 }
 
-// Button interrupt
 void button_interrupts_function(void* context, alt_u32 id)
 {
-  // need to cast the context first before using it
-  int* temp = (int*) context;
-  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+    IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 
-  // clears the edge capture register
-  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-
-
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  xSemaphoreGiveFromISR(buttonSem, &xHigherPriorityTaskWoken);
-  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(buttonSem, &xHigherPriorityTaskWoken);
+    portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
 }
 
-// TASKS
+// Tasks
 
-// calculate the frequency and the rate of change of frequency
+// Task 1 – Compute frequency & RoC, detect instability
 void FrequencyAnalysisTask(void *pvParameters)
 {
-    int rawFreqValue;
-    double localFreq;
-    double localROC;
+    unsigned int rawFreqValue;
+    double localFreq, localROC;
 
-    while(1)
-    {
-        // Wait for data to arrive in the queue
-        if (xQueueReceive(rawFreqData, &rawFreqValue, portMAX_DELAY) == pdTRUE)
-        {
+    while (1) {
+        if (xQueueReceive(rawFreqData, &rawFreqValue, portMAX_DELAY) == pdTRUE) {
             localFreq = 16000.0 / (double)rawFreqValue;
+            localROC  = fabs((localFreq - prevFreq) * 16000.0 / (double)rawFreqValue);
+            prevFreq  = localFreq;
 
-            localROC = (localFreq - prevFreq) / (double)rawFreqValue;
-            printf("Frequency: %.3f Hz | RoC: %.3f Hz/s\n", localFreq, localROC);
+            xSemaphoreTake(freqMutex, portMAX_DELAY);
+            freq = localFreq;
+            ROC  = localROC;
+            xSemaphoreGive(freqMutex);
 
-            prevFreq = localFreq;
-        }
+//            printf("Freq: %.3f Hz | RoC: %.3f Hz/s\n", localFreq, localROC);
 
-        xSemaphoreTake(freqMutex, portMAX_DELAY);
-
-        freq = localFreq;
-        ROC = localROC;
-
-        xSemaphoreGive(freqMutex);
-
-        // if threshold not met, change the state and go to the load task
-        if(freq < freqThreshold || ROC < ROCThreshold){
-
-        	xSemaphoreTake(stateMutex, portMAX_DELAY);
-
-        	if(systemState == 0){
-        		systemState = 1;
-        	}
-
-        	xSemaphoreGive(loadSem);
-        	xSemaphoreGive(stateMutex);
-
+            // If unstable and not already managing, trigger load manager
+            if (isUnstable(localFreq, localROC)) {
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                if (systemState == STATE_NORMAL) {
+                    systemState = STATE_MANAGING;
+                    xSemaphoreGive(stateMutex);
+                    xSemaphoreGive(loadSem);   // wake load control task
+                } else {
+                    xSemaphoreGive(stateMutex);
+                }
+            }
         }
     }
 }
 
-// Switches between Normal and Maintenance State
-void vCheckButtonTask(){
-
-	while(1){
-
-		// Triggered by the button
-		xSemaphoreTake(buttonSem, portMAX_DELAY);
-
-		xSemaphoreTake(stateMutex, portMAX_DELAY);
-		if(systemState == 0){
-			systemState = 2;
-		}
-		else if(systemState == 2){
-			systemState = 0;
-		}
-
-		xSemaphoreGive(stateMutex);
-	}
-}
-
-// Controls which loads to be shed. INCOMPLETE - load shedding and gaining back logic.
-void vLoadControlTask(void *pvParameters) {
-    while(1) {
-
-        // starts when state goes to 1
+// Task 2 – Manage load shedding and reconnection
+void vLoadControlTask(void *pvParameters)
+{
+    while (1) {
+        // Wait until instability is detected
         xSemaphoreTake(loadSem, portMAX_DELAY);
 
-      // IMPLEMENT CODE TO SHED 1st load
+        // Requirement: first shed must happen within 200ms of detection
+        // We shed immediately here (well within 200ms assuming task runs promptly)
+        shedLowestPriorityLoad();
 
-        // 500ms timer loop for managing state
-        TickType_t breachStart = 0; // apparently can use this to start timer in here
-        int breachActive = 0; // make sure that we are still in the state
+        // 500ms observation loop
+        TickType_t periodStart   = xTaskGetTickCount();
+        int        lastUnstable  = 1;   // we just detected instability
 
-        while(1) {
-
-        	// MAYBE NO DELAY IS NEEDED BUT NOT SURE (MIGHT HAVE TO REMOVE THIS OR REDUCE IT)
-            vTaskDelay(pdMS_TO_TICKS(50)); // poll every 50ms
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(10));  // fine-grained polling
 
             xSemaphoreTake(freqMutex, portMAX_DELAY);
             double localFreq = freq;
@@ -164,64 +215,148 @@ void vLoadControlTask(void *pvParameters) {
             int state = systemState;
             xSemaphoreGive(stateMutex);
 
-            if (localFreq < freqThreshold || localROC < -ROCThreshold) {
-                if (!breachActive) {
-
-                    // Breach just started, record time
-                    breachStart = xTaskGetTickCount();
-                    breachActive = 1;
-
-                    // used to compare the time between events without reseting the clock, check if 500ms have passed
-                } else if (xTaskGetTickCount() - breachStart >= pdMS_TO_TICKS(500)) {
-
-                	// ADD CODE TO SHED LOAD
-                    breachStart = xTaskGetTickCount(); // reset for next shed
+            // Maintenance mode overrides relay management
+            if (state == STATE_MAINTENANCE) {
+                // Reconnect all relay-shed loads so switches take full control
+                xSemaphoreTake(loadMutex, portMAX_DELAY);
+                for (int i = 0; i < NUM_LOADS; i++) {
+                    loadRelayOn[i]     = 1;
+                    loadShedByRelay[i] = 0;
                 }
-            } else {
-
-                // Recovered, reset timer
-                breachActive = 0;
-
-                xSemaphoreTake(stateMutex, portMAX_DELAY);
-                systemState = STATE_NORMAL;
-                xSemaphoreGive(stateMutex);
+                updateLEDs();
+                xSemaphoreGive(loadMutex);
                 break;
+            }
 
-                // WE ARE BACK IN STATE 0 AND NOTHING ELSE NEEDS TO BE DONE.
-                // NEED TO ADD CODE TO GAIN BACK THE LOAD THAT WE SHED AS PER THE PRIORITIES
+            int nowUnstable = isUnstable(localFreq, localROC);
+
+            // If stability status has changed, reset the 500ms window
+            if (nowUnstable != lastUnstable) {
+                periodStart  = xTaskGetTickCount();
+                lastUnstable = nowUnstable;
+            }
+
+            // Has 500ms elapsed in the current status?
+            if ((xTaskGetTickCount() - periodStart) >= pdMS_TO_TICKS(500)) {
+                periodStart = xTaskGetTickCount();  // reset for next window
+
+                if (nowUnstable) {
+                    // Shed next lowest-priority load
+                    if (!shedLowestPriorityLoad()) {
+                        // All loads already shed – wait and keep watching
+                    }
+                } else {
+                    // Stable for 500ms – reconnect highest-priority shed load
+                    reconnectHighestPriorityLoad();
+
+                    if (allLoadsReconnected()) {
+                        // Return to normal
+                        xSemaphoreTake(stateMutex, portMAX_DELAY);
+                        systemState = STATE_NORMAL;
+                        xSemaphoreGive(stateMutex);
+                        break;
+                    }
+                }
             }
         }
     }
 }
 
-// SETUP
+// Task 3 – Poll slide switches to update load enable state
+void vSwitchPollTask(void *pvParameters)
+{
+    while (1) {
+        unsigned int sw = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        int state = systemState;
+        xSemaphoreGive(stateMutex);
+
+        xSemaphoreTake(loadMutex, portMAX_DELAY);
+        for (int i = 0; i < NUM_LOADS; i++) {
+            int swOn = (sw >> i) & 1;
+
+            if (state == STATE_MANAGING) {
+                // During managing: switches can only TURN OFF, not turn on new loads
+                if (!swOn) {
+                    loadEnabled[i] = 0;
+                }
+                // Ignore attempts to turn on new loads
+            } else {
+                // Normal or maintenance: switches have full control
+                loadEnabled[i] = swOn;
+                if (state == STATE_MAINTENANCE) {
+                    // Relay has no say in maintenance – ensure relay bits are clear
+                    loadRelayOn[i]     = 1;
+                    loadShedByRelay[i] = 0;
+                }
+            }
+        }
+        updateLEDs();
+        xSemaphoreGive(loadMutex);
+
+        vTaskDelay(pdMS_TO_TICKS(50));  // poll at 20 Hz
+    }
+}
+
+// Task 4 – Handle push button (toggle maintenance mode)
+void vCheckButtonTask(void *pvParameters)
+{
+    while (1) {
+        xSemaphoreTake(buttonSem, portMAX_DELAY);
+
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        if (systemState == STATE_NORMAL) {
+            systemState = STATE_MAINTENANCE;
+            printf("Entering MAINTENANCE mode\n");
+        } else if (systemState == STATE_MAINTENANCE) {
+            systemState = STATE_NORMAL;
+            printf("Exiting MAINTENANCE mode\n");
+        }
+        // Button press during STATE_MANAGING is ignored (or you can allow it)
+        xSemaphoreGive(stateMutex);
+    }
+}
+
+// Setup
 
 void SetUpMisc(void)
 {
-    rawFreqData = xQueueCreate(2, sizeof(unsigned int)); // Create the queue
-    freqMutex = xSemaphoreCreateMutex();
-    buttonSem = xSemaphoreCreateBinary();
-    stateMutex = xSemaphoreCreateMutex(); //mutex for states
-    loadSem = xSemaphoreCreateBinary();	//mutex to start managestate
- }
+    // Initialise load arrays
+    for (int i = 0; i < NUM_LOADS; i++) {
+        loadEnabled[i]    = 0;
+        loadRelayOn[i]    = 1;
+        loadShedByRelay[i] = 0;
+    }
+    IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE,   0);
+    IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
+
+    rawFreqData = xQueueCreate(5, sizeof(unsigned int));
+    freqMutex   = xSemaphoreCreateMutex();
+    stateMutex  = xSemaphoreCreateMutex();
+    loadMutex   = xSemaphoreCreateMutex();
+    buttonSem   = xSemaphoreCreateBinary();
+    loadSem     = xSemaphoreCreateBinary();
 }
 
 void SetUpISRs(void)
 {
-    // Register frequency interrupt
-   alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, FrequencyRelayISR);
+    alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, FrequencyRelayISR);
 
-
+    // Enable edge capture on push button
+    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+    alt_irq_register(PUSH_BUTTON_IRQ, 0, button_interrupts_function);
+}
 
 void SetUpTasks(void)
 {
-    // Create the task that will process frequency data
-    xTaskCreate(FrequencyAnalysisTask, "FreqAnalysis", TASK_STACKSIZE, NULL, 2, NULL);
-//    xTaskCreate(vButtonHealthTask, "Button Health", TASK_STACKSIZE, NULL, 2, NULL);
-    xTaskCreate(vCheckButtonTask, "check button", TASK_STACKSIZE, NULL, 1, NULL);
-    xTaskCreate(vLoadControlTask, "Load Control", TASK_STACKSIZE, NULL, 2, NULL);
+    xTaskCreate(FrequencyAnalysisTask, "FreqAnalysis", TASK_STACKSIZE, NULL, 4, NULL);
+    xTaskCreate(vLoadControlTask,      "LoadControl",  TASK_STACKSIZE, NULL, 3, NULL);
+    xTaskCreate(vSwitchPollTask,       "SwitchPoll",   TASK_STACKSIZE, NULL, 2, NULL);
+    xTaskCreate(vCheckButtonTask,      "ButtonCheck",  TASK_STACKSIZE, NULL, 2, NULL);
 
-    vTaskStartScheduler(); // Start the FreeRTOS scheduler
+    vTaskStartScheduler();
 }
 
 int main(void)
