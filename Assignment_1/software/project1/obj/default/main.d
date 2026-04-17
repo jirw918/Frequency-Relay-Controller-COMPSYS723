@@ -14,6 +14,8 @@ obj/default/main.o: main.c ../project1_bsp/system.h \
  ../project1_bsp//HAL/inc/sys/alt_llist.h \
  ../project1_bsp//HAL/inc/priv/alt_dev_llist.h \
  ../project1_bsp//drivers/inc/altera_up_avalon_video_pixel_buffer_dma.h \
+ ../project1_bsp//drivers/inc/altera_up_avalon_ps2.h \
+ ../project1_bsp//drivers/inc/altera_up_ps2_keyboard.h \
  ../project1_bsp//drivers/inc/altera_up_avalon_ps2.h
 
 ../project1_bsp/system.h:
@@ -69,5 +71,9 @@ freertos/portmacro.h:
 ../project1_bsp//HAL/inc/priv/alt_dev_llist.h:
 
 ../project1_bsp//drivers/inc/altera_up_avalon_video_pixel_buffer_dma.h:
+
+../project1_bsp//drivers/inc/altera_up_avalon_ps2.h:
+
+../project1_bsp//drivers/inc/altera_up_ps2_keyboard.h:
 
 ../project1_bsp//drivers/inc/altera_up_avalon_ps2.h:

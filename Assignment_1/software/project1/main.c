@@ -19,6 +19,7 @@
 #include "altera_up_avalon_video_character_buffer_with_dma.h"
 #include "altera_up_avalon_video_pixel_buffer_dma.h"
 #include "altera_up_avalon_ps2.h"
+#include "altera_up_ps2_keyboard.h"
 
 #define TASK_STACKSIZE 2048
 #define NUM_LOADS      5
@@ -32,7 +33,9 @@
 
 // --- Globals ---
 static QueueHandle_t rawFreqData;
+static QueueHandle_t ps2Queue;
 static SemaphoreHandle_t freqMutex;
+static SemaphoreHandle_t threshMutex;
 static SemaphoreHandle_t stateMutex;
 static SemaphoreHandle_t loadMutex;
 SemaphoreHandle_t buttonSem;
@@ -42,6 +45,8 @@ static double prevFreq   = 0.0;
 static double freq       = 0.0;
 static double ROC        = 0.0;
 volatile int  systemState = STATE_NORMAL;
+static double freqThreshold = FREQ_THRESHOLD;  // default 49.0
+static double rocThreshold  = ROC_THRESHOLD;   // default 10.0
 
 /*
  * loadEnabled[i]  – user's switch intent: 1 = user wants load ON, 0 = user wants it OFF
@@ -152,6 +157,51 @@ void button_interrupts_function(void* context, alt_u32 id)
     portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
 }
 
+//void ps2_isr(void *context, alt_u32 id)
+//{
+//
+//	 printf("PS2 ISR HIT\n");  // DEBUG
+//
+//    alt_up_ps2_dev *ps2 = (alt_up_ps2_dev *)context;
+//    char ascii;
+//    unsigned char key = 0;
+//    KB_CODE_TYPE decode_mode;
+//
+//    // decode_scancode is safe to call from ISR — it only reads the FIFO
+//    if (decode_scancode(ps2, &decode_mode, &key, &ascii) == 0) {
+////        if (decode_mode == KB_ASCII_MAKE_CODE) {
+////            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+////            xQueueSendToBackFromISR(ps2Queue, &ascii, &xHigherPriorityTaskWoken);
+////            portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+////        }
+//    	if (decode_scancode(ps2, &decode_mode, &key, &ascii) == 0) {
+//    	    printf("ascii: %c (%d)\n", ascii, ascii);
+//
+//    	    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+//    	    xQueueSendToBackFromISR(ps2Queue, &ascii, &xHigherPriorityTaskWoken);
+//    	    portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+//    	}
+//    }
+//}
+
+void ps2_isr(void *context, alt_u32 id)
+{
+    alt_up_ps2_dev *ps2 = (alt_up_ps2_dev *)context;
+    char ascii;
+    unsigned char key = 0;
+    KB_CODE_TYPE decode_mode;
+
+    // Call it ONCE. It returns 0 only when a full scancode is recognized.
+    if (decode_scancode(ps2, &decode_mode, &key, &ascii) == 0) {
+        // We usually only care about the "Make" code (key pressed)
+        // and only keys that have an ASCII representation.
+        if (decode_mode == KB_ASCII_MAKE_CODE) {
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xQueueSendToBackFromISR(ps2Queue, &ascii, &xHigherPriorityTaskWoken);
+            portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+        }
+    }
+}
 // Tasks
 
 // Task 1 – Compute frequency & RoC, detect instability
@@ -318,6 +368,49 @@ void vCheckButtonTask(void *pvParameters)
     }
 }
 
+void vPS2Task(void *pvParameters)
+{
+    char key;
+    printf("PS2 task running\n");
+    while (1) {
+        // Block until a key arrives from the ISR
+        if (xQueueReceive(ps2Queue, &key, portMAX_DELAY) == pdTRUE) {
+        	printf("DEBUG: Task woke up with key: %c (0x%02x)\n", key, key);
+            xSemaphoreTake(threshMutex, portMAX_DELAY);
+
+            switch (key) {
+                case 'Q':
+                    freqThreshold -= 0.5;
+                    printf("Freq threshold: %.1f Hz\n", freqThreshold);
+                    if (freqThreshold < 45.0) freqThreshold = 45.0;
+                    printf("Max Threshold reached. Freq: %.1f Hz\n", freqThreshold);
+                    break;
+                case 'A':
+                    freqThreshold += 0.5;
+                    printf("Freq threshold: %.1f Hz\n", freqThreshold);
+                    if (freqThreshold > 52.0) freqThreshold = 52.0;
+                    printf("Max Threshold reached. Freq: %.1f Hz\n", freqThreshold);
+                    break;
+                case 'W':
+                    rocThreshold -= 0.5;
+                    printf("roc threshold: %.1f Hz\n", rocThreshold);
+                    if (rocThreshold < 1.0) rocThreshold = 1.0;
+                    printf("Max Threshold reached. ROC: %.1f Hz/s\n", rocThreshold);
+                    break;
+                case 'S':
+                    rocThreshold += 0.5;
+                    printf("roc threshold: %.1f Hz\n", rocThreshold);
+                    if (rocThreshold > 10.0) rocThreshold = 100.0;
+                    printf("Max Threshold reached. ROC: %.1f Hz/s\n", rocThreshold);
+                    break;
+                default:
+                    break;
+            }
+            printf("Received key: %c\n", key);
+            xSemaphoreGive(threshMutex);
+        }
+    }
+}
 // Setup
 
 void SetUpMisc(void)
@@ -332,7 +425,10 @@ void SetUpMisc(void)
     IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
 
     rawFreqData = xQueueCreate(5, sizeof(unsigned int));
+    ps2Queue           = xQueueCreate(16,  sizeof(char));
+
     freqMutex   = xSemaphoreCreateMutex();
+    threshMutex   = xSemaphoreCreateMutex();
     stateMutex  = xSemaphoreCreateMutex();
     loadMutex   = xSemaphoreCreateMutex();
     buttonSem   = xSemaphoreCreateBinary();
@@ -347,6 +443,16 @@ void SetUpISRs(void)
     IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
     IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
     alt_irq_register(PUSH_BUTTON_IRQ, 0, button_interrupts_function);
+
+    alt_up_ps2_dev *ps2 = alt_up_ps2_open_dev(PS2_NAME);
+
+    if (ps2 == NULL) {
+        printf("PS2 open failed\n");
+    } else {
+    	alt_up_ps2_clear_fifo (ps2) ;
+        alt_irq_register(PS2_IRQ, ps2, ps2_isr);
+        alt_up_ps2_enable_read_interrupt(ps2);
+    }
 }
 
 void SetUpTasks(void)
@@ -355,6 +461,8 @@ void SetUpTasks(void)
     xTaskCreate(vLoadControlTask,      "LoadControl",  TASK_STACKSIZE, NULL, 3, NULL);
     xTaskCreate(vSwitchPollTask,       "SwitchPoll",   TASK_STACKSIZE, NULL, 2, NULL);
     xTaskCreate(vCheckButtonTask,      "ButtonCheck",  TASK_STACKSIZE, NULL, 2, NULL);
+    xTaskCreate(vPS2Task,              "PS2Task",      TASK_STACKSIZE, NULL, 2, NULL);
+
 
     vTaskStartScheduler();
 }
