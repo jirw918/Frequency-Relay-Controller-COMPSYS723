@@ -1,0 +1,563 @@
+/*
+ * main.c
+ *
+ *  Created on: 13/04/2026
+ *      Author: jevaa
+ */
+
+
+#include "sys/alt_stdio.h"
+
+/* Standard includes. */
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "system.h"
+/* Scheduler includes. */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/portmacro.h"
+#include "freertos/timers.h"
+
+//Altera includes
+#include "altera_avalon_pio_regs.h"
+#include "alt_types.h"                 	// alt_u32 is a kind of alt_types
+#include "sys/alt_irq.h"              	// to register interrupts
+
+#include "altera_up_avalon_video_character_buffer_with_dma.h"
+#include "altera_up_avalon_video_pixel_buffer_dma.h"
+
+#include "altera_up_avalon_ps2.h"
+
+
+// Definition of Task Stacks
+#define   TASK_STACKSIZE       2048
+#define STATE_NORMAL      0
+#define STATE_MANAGING    1
+#define STATE_MAINTENANCE 2
+
+#define freqThreshold 49.0 //these need to be changed from defines later in order for them to be set via keyboard input.
+#define ROCThreshold 0.05 //same here?
+
+
+//global variable definition
+volatile int systemState = 0;
+#define STATE_NORMAL      0
+#define STATE_MANAGING    1
+#define STATE_MAINTENANCE 2
+
+volatile int buttonValue = 0;
+volatile unsigned  int uiSwitchValue = 0;
+volatile int loadState;
+
+static QueueHandle_t rawFreqData;
+static SemaphoreHandle_t freqMutex;
+SemaphoreHandle_t buttonSem;
+SemaphoreHandle_t thresholdSem;
+SemaphoreHandle_t stateMutex;
+SemaphoreHandle_t loadSem;
+
+static double prevFreq = 0;
+double freq;
+double ROC;
+
+
+//For frequency plot *******
+
+#define FREQPLT_ORI_X 101		//x axis pixel position at the plot origin
+#define FREQPLT_GRID_SIZE_X 5	//pixel separation in the x axis between two data points
+#define FREQPLT_ORI_Y 199.0		//y axis pixel position at the plot origin
+#define FREQPLT_FREQ_RES 20.0	//number of pixels per Hz (y axis scale)
+
+#define ROCPLT_ORI_X 101
+#define ROCPLT_GRID_SIZE_X 5
+#define ROCPLT_ORI_Y 259.0
+#define ROCPLT_ROC_RES 0.5		//number of pixels per Hz/s (y axis scale)
+
+#define MIN_FREQ 45.0 //minimum frequency to draw
+
+#define PRVGADraw_Task_P      (tskIDLE_PRIORITY+1)
+TaskHandle_t PRVGADraw;
+
+static QueueHandle_t Q_freq_data;
+
+typedef struct{
+	unsigned int x1;
+	unsigned int y1;
+	unsigned int x2;
+	unsigned int y2;
+}Line;
+
+
+/****** VGA display ******/
+
+void PRVGADraw_Task(void *pvParameters ){
+
+
+	//initialize VGA controllers
+	alt_up_pixel_buffer_dma_dev *pixel_buf;
+	pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+	if(pixel_buf == NULL){
+		printf("can't find pixel buffer device\n");
+	}
+	alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
+
+	alt_up_char_buffer_dev *char_buf;
+	char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+	if(char_buf == NULL){
+		printf("can't find char buffer device\n");
+	}
+	alt_up_char_buffer_clear(char_buf);
+
+
+
+	//Set up plot axes
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 50, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 220, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+
+	alt_up_char_buffer_string(char_buf, "Frequency(Hz)", 4, 4);
+	alt_up_char_buffer_string(char_buf, "52", 10, 7);
+	alt_up_char_buffer_string(char_buf, "50", 10, 12);
+	alt_up_char_buffer_string(char_buf, "48", 10, 17);
+	alt_up_char_buffer_string(char_buf, "46", 10, 22);
+
+	alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)", 4, 26);
+	alt_up_char_buffer_string(char_buf, "60", 10, 28);
+	alt_up_char_buffer_string(char_buf, "30", 10, 30);
+	alt_up_char_buffer_string(char_buf, "0", 10, 32);
+	alt_up_char_buffer_string(char_buf, "-30", 9, 34);
+	alt_up_char_buffer_string(char_buf, "-60", 9, 36);
+
+	//CUSTOM
+
+	alt_up_char_buffer_string(char_buf, "x", 0, 0);
+	alt_up_char_buffer_string(char_buf, "a", 79, 0);
+	alt_up_char_buffer_string(char_buf, "b", 0, 59);
+	alt_up_char_buffer_string(char_buf, "c", 79, 59);
+
+	// --
+
+
+	double freq[100], dfreq[100];
+	int i = 99, j = 0;
+	Line line_freq, line_roc;
+
+	while(1){
+
+		//receive frequency data from queue
+		while(uxQueueMessagesWaiting( Q_freq_data ) != 0){
+			xQueueReceive( Q_freq_data, freq+i, 0 );
+
+			//calculate frequency RoC
+
+			if(i==0){
+				dfreq[0] = (freq[0]-freq[99]) * 2.0 * freq[0] * freq[99] / (freq[0]+freq[99]);
+			}
+			else{
+				dfreq[i] = (freq[i]-freq[i-1]) * 2.0 * freq[i]* freq[i-1] / (freq[i]+freq[i-1]);
+			}
+
+			if (dfreq[i] > 100.0){
+				dfreq[i] = 100.0;
+			}
+
+
+			i =	++i%100; //point to the next data (oldest) to be overwritten
+
+		}
+
+		//clear old graph to draw new graph
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 0, 639, 199, 0, 0);
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 201, 639, 299, 0, 0);
+
+		for(j=0;j<99;++j){ //i here points to the oldest data, j loops through all the data to be drawn on VGA
+			if (((int)(freq[(i+j)%100]) > MIN_FREQ) && ((int)(freq[(i+j+1)%100]) > MIN_FREQ)){
+				//Calculate coordinates of the two data points to draw a line in between
+				//Frequency plot
+				line_freq.x1 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * j;
+				line_freq.y1 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j)%100] - MIN_FREQ));
+
+				line_freq.x2 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * (j + 1);
+				line_freq.y2 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j+1)%100] - MIN_FREQ));
+
+				//Frequency RoC plot
+				line_roc.x1 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * j;
+				line_roc.y1 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j)%100]);
+
+				line_roc.x2 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * (j + 1);
+				line_roc.y2 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j+1)%100]);
+
+				//Draw
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_freq.x1, line_freq.y1, line_freq.x2, line_freq.y2, 0x3ff << 0, 0);
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1, line_roc.x2, line_roc.y2, 0x3ff << 0, 0);
+			}
+		}
+		vTaskDelay(10);
+
+	}
+}
+
+
+//***************************
+
+//global variable semaphores
+SemaphoreHandle_t systemStateSem = NULL;
+
+
+void vInitSemaphores() {
+	systemStateSem = xSemaphoreCreateBinary();
+	    if (systemStateSem != NULL) {
+	        xSemaphoreGive(systemStateSem);
+	    }
+}
+
+/* Interrupt defines */
+
+// Frequency hardware interrupt
+void FrequencyRelayISR(void* context, alt_u32 id)
+{
+    unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
+    printf("%d", temp);
+    xQueueSendToBackFromISR(rawFreqData, &temp, pdFALSE); // Send data to the queue
+}
+
+//Button press interrupt
+void button_interrupts_function(void* context, alt_u32 id)
+{
+  // need to cast the context first before using it
+  int* temp = (int*) context;
+  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+
+  // clears the edge capture register
+  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(systemStateSem, &xHigherPriorityTaskWoken);
+  portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+}
+
+
+volatile int interrupt_count = 0;
+
+void ps2_isr(void* context, alt_u32 id)
+{
+    alt_up_ps2_dev * ps2_device = (alt_up_ps2_dev *)context;
+    unsigned char byte;
+    int status;
+
+    interrupt_count++;
+
+    // Read the scan code
+    status = alt_up_ps2_read_data_byte(ps2_device, &byte);
+
+    if(status == 0) {
+        printf("Scan code: 0x%02x\n", byte);
+    } else {
+        printf("Read failed, status: %d\n", status);
+    }
+
+    // Clear the interrupt
+    alt_up_ps2_clear_fifo(ps2_device);
+}
+
+//init interrupts
+
+//--system timer config and functions--
+
+typedef void (*TimerCallback_t)(void);
+static TimerCallback_t callback_500ms = NULL;
+static TimerCallback_t callback_200ms = NULL;
+static TimerHandle_t timer_500ms;
+static TimerHandle_t timer_200ms;
+
+static void timer_500ms_callback(TimerHandle_t xTimer)
+{
+    if (callback_500ms != NULL) callback_500ms();
+}
+
+static void timer_200ms_callback(TimerHandle_t xTimer)
+{
+    if (callback_200ms != NULL) callback_200ms();
+}
+
+
+
+void SystemTimer_Register500ms(TimerCallback_t callback) { callback_500ms = callback; }
+void SystemTimer_Register200ms(TimerCallback_t callback) { callback_200ms = callback; }
+
+void timer_500ms_handler(void)
+{
+    // Your 500ms periodic code here
+    // e.g., toggle LED, sample sensor, etc.
+	printf("500ms timer\n");
+}
+
+void timer_200ms_handler(void)
+{
+    // Your 200ms periodic code here
+	printf("200ms timer\n");
+}
+
+
+void SystemTimer_Init(void)
+{
+	 SystemTimer_Register500ms(timer_500ms_handler);
+	 SystemTimer_Register200ms(timer_200ms_handler);
+
+    timer_500ms = xTimerCreate("T500", pdMS_TO_TICKS(500), pdTRUE, 0, timer_500ms_callback);
+    timer_200ms = xTimerCreate("T200", pdMS_TO_TICKS(200), pdTRUE, 0, timer_200ms_callback);
+
+    xTimerStart(timer_500ms, 0);
+    xTimerStart(timer_200ms, 0);
+}
+//--system timer code end--
+void vSwitchPoll(){
+	while(1){
+		if(systemState == 1){
+			if(IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE) < uiSwitchValue){
+				uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+			}
+		} else {
+		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+		}
+
+		printf("%d\n", uiSwitchValue);
+		printf("butoon %d\n", buttonValue);
+		vTaskDelay(200);
+	}
+}
+
+void vPrintAlive(){
+	while(1){
+		printf("da dump\n");
+		vTaskDelay(1000);
+	}
+
+}
+
+void vCheckButtonTask(){
+
+	while(1){
+
+		// Triggered by the button
+		xSemaphoreTake(buttonSem, portMAX_DELAY);
+
+		xSemaphoreTake(stateMutex, portMAX_DELAY);
+		if(systemState == 0){
+			systemState = 2;
+		}
+		else if(systemState == 2){
+			systemState = 0;
+		}
+
+		xSemaphoreGive(stateMutex);
+	}
+}
+
+
+volatile uint8_t managingState = 0; //0 not entered, 1 just entered, 2 in managingstate.
+
+// Controls which loads to be shed. INCOMPLETE - load shedding and gaining back logic.
+void vLoadControlTask(void *pvParameters) {
+    while(1) {
+    	printf("a\n");
+        // starts when state goes to 1
+        xSemaphoreTake(loadSem, portMAX_DELAY);
+
+      // IMPLEMENT CODE TO SHED 1st load
+
+        // 500ms timer loop for managing state
+        TickType_t breachStart = 0; // apparently can use this to start timer in here
+        int breachActive = 0; // make sure that we are still in the state
+
+        while(1) {
+
+        	// MAYBE NO DELAY IS NEEDED BUT NOT SURE (MIGHT HAVE TO REMOVE THIS OR REDUCE IT)
+            vTaskDelay(pdMS_TO_TICKS(50)); // poll every 50ms
+
+            xSemaphoreTake(freqMutex, portMAX_DELAY);
+            double localFreq = freq;
+            double localROC  = ROC;
+            xSemaphoreGive(freqMutex);
+
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            int state = systemState;
+            xSemaphoreGive(stateMutex);
+
+            if (localFreq < freqThreshold || localROC < -ROCThreshold) {
+                if (!breachActive) {
+
+                    // Breach just started, record time
+                    breachStart = xTaskGetTickCount();
+                    breachActive = 1;
+
+                    // used to compare the time between events without reseting the clock, check if 500ms have passed
+                } else if (xTaskGetTickCount() - breachStart >= pdMS_TO_TICKS(500)) {
+
+                	// ADD CODE TO SHED LOAD
+                    breachStart = xTaskGetTickCount(); // reset for next shed
+                }
+            } else {
+
+                // Recovered, reset timer
+                breachActive = 0;
+
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                systemState = STATE_NORMAL;
+                xSemaphoreGive(stateMutex);
+                break;
+
+                // WE ARE BACK IN STATE 0 AND NOTHING ELSE NEEDS TO BE DONE.
+                // NEED TO ADD CODE TO GAIN BACK THE LOAD THAT WE SHED AS PER THE PRIORITIES
+            }
+        }
+    }
+}
+
+void FrequencyAnalysisTask(void *pvParameters)
+{
+	printf("f\n");
+    int rawFreqValue;
+    double localFreq;
+    double localROC;
+
+    while(1)
+    {
+        // Wait for data to arrive in the queue
+        if (xQueueReceive(rawFreqData, &rawFreqValue, portMAX_DELAY) == pdTRUE)
+        {
+            localFreq = 16000.0 / (double)rawFreqValue;
+
+            localROC = (localFreq - prevFreq) / (double)rawFreqValue;
+            printf("Frequency: %.3f Hz | RoC: %.3f Hz/s\n", localFreq, localROC);
+
+            prevFreq = localFreq;
+        }
+
+        xSemaphoreTake(freqMutex, portMAX_DELAY);
+
+        freq = localFreq;
+        ROC = localROC;
+
+        xSemaphoreGive(freqMutex);
+
+        // if threshold not met, change the state and go to the load task
+        if(freq < freqThreshold || ROC < ROCThreshold){
+
+        	xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+        	if(systemState == 0){
+        		systemState = 1;
+        	}
+
+        	xSemaphoreGive(loadSem);
+        	xSemaphoreGive(stateMutex);
+
+        }
+    }
+}
+
+void SetUpMisc(void)
+{
+    rawFreqData = xQueueCreate(2, sizeof(unsigned int)); // Create the queue
+    freqMutex = xSemaphoreCreateMutex();
+    buttonSem = xSemaphoreCreateBinary();
+    stateMutex = xSemaphoreCreateMutex(); //mutex for states
+    loadSem = xSemaphoreCreateBinary();	  //mutex to start managestate
+ }
+
+void SetUpISRs(void)
+{
+    // Register frequency interrupt
+   alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, FrequencyRelayISR);
+
+}
+
+
+
+
+int main(void)
+{
+	 alt_irq_cpu_enable_interrupts();
+
+	printf("Hello\n");
+	//alt_putstr("Test 1\n");
+
+	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, 262144);
+
+
+	vInitSemaphores();
+	SetUpMisc();
+
+	  // clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
+	  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+	  // enable interrupts for all buttons
+	  IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
+
+	  // register the ISR
+	  alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
+
+	  // Register frequency interrupt
+	  alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, FrequencyRelayISR);
+
+
+
+	//timer setup
+	SystemTimer_Init();
+
+	//PS2 SETUP
+		    // Open device
+		    alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
+		    if(ps2_device == NULL){
+		        printf("ERROR: Can't open PS/2\n");
+		        return 1;
+		    }
+		    printf("PS/2 device opened at: %p\n", ps2_device);
+
+		    // Clear FIFO
+		    alt_up_ps2_clear_fifo(ps2_device);
+		    printf("FIFO cleared\n");
+
+		    // Register interrupt FIRST (before enabling)
+		    printf("Registering interrupt (IRQ %d)...\n", PS2_IRQ);
+		    int status = alt_irq_register(PS2_IRQ, (void*)ps2_device, ps2_isr);
+		    if(status != 0) {
+		        printf("ERROR: Interrupt registration failed: %d\n", status);
+		        return 1;
+		    }
+		    printf("Interrupt registered successfully\n");
+
+		    // Enable PS/2 interrupts
+		    alt_up_ps2_enable_read_interrupt(ps2_device);
+		    printf("PS/2 read interrupt enabled\n");
+
+
+
+		    //VGA
+
+	//Create Tasks
+	xTaskCreate(FrequencyAnalysisTask, "FreqAnalysis", TASK_STACKSIZE, NULL, 2, NULL);
+	printf("freq\n");
+	xTaskCreate(PRVGADraw_Task, "DrawTsk", configMINIMAL_STACK_SIZE, NULL, 1, &PRVGADraw );
+	printf("vga\n");
+	xTaskCreate(vLoadControlTask, "Load Control", TASK_STACKSIZE, NULL, 2, NULL);
+	printf("loadcontroltask\n");
+	xTaskCreate(vCheckButtonTask, "check button", TASK_STACKSIZE, NULL, 1, NULL);
+	printf("checkbutton\n");
+	xTaskCreate(vSwitchPoll, "keypoll", TASK_STACKSIZE, NULL, 1, NULL);
+	printf("SwitchPoll\n");
+
+	vTaskStartScheduler();
+
+	for (;;);
+
+	return 0;
+
+}

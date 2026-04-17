@@ -10,6 +10,7 @@ obj/default/main.o: main.c \
  ../freq_relay_controller_bsp//HAL/inc/priv/alt_legacy_irq.h \
  freertos/mpu_wrappers.h freertos/task.h freertos/list.h freertos/queue.h \
  freertos/semphr.h freertos/queue.h freertos/portmacro.h \
+ freertos/timers.h freertos/task.h \
  ../freq_relay_controller_bsp//drivers/inc/altera_avalon_pio_regs.h \
  ../freq_relay_controller_bsp//HAL/inc/io.h \
  ../freq_relay_controller_bsp//HAL/inc/alt_types.h \
@@ -59,6 +60,10 @@ freertos/semphr.h:
 freertos/queue.h:
 
 freertos/portmacro.h:
+
+freertos/timers.h:
+
+freertos/task.h:
 
 ../freq_relay_controller_bsp//drivers/inc/altera_avalon_pio_regs.h:
 

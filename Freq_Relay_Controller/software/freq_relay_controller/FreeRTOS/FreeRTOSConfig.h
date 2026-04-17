@@ -91,7 +91,7 @@
 #define configUSE_IDLE_HOOK				0
 #define configUSE_TICK_HOOK				0
 #define	configUSE_TIMERS				1
-#define configTIMER_TASK_PRIORITY		3
+#define configTIMER_TASK_PRIORITY		2
 #define configTIMER_QUEUE_LENGTH		10
 #define	configTIMER_TASK_STACK_DEPTH	2048
 #define configTICK_RATE_HZ				( ( portTickType ) 1000 )
@@ -122,7 +122,7 @@ to exclude the API function. */
 #define INCLUDE_vTaskDelete					1
 #define INCLUDE_vTaskCleanUpResources		1
 #define INCLUDE_vTaskSuspend				0
-#define INCLUDE_vTaskDelayUntil				0
+#define INCLUDE_vTaskDelayUntil				1
 #define INCLUDE_vTaskDelay					1
 #define INCLUDE_uxTaskGetStackHighWaterMark	1
 
