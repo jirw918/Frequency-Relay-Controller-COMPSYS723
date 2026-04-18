@@ -28,8 +28,8 @@
 #define STATE_MANAGING    1
 #define STATE_MAINTENANCE 2
 
-static double FREQ_THRESHOLD = 49.0;
-static double ROC_THRESHOLD  = 10;
+#define FREQ_THRESHOLD  49.0
+#define ROC_THRESHOLD   10
 
 // --- Globals ---
 static QueueHandle_t rawFreqData;
@@ -45,8 +45,8 @@ static double prevFreq   = 0.0;
 static double freq       = 0.0;
 static double ROC        = 0.0;
 volatile int  systemState = STATE_NORMAL;
-//static double localFreqThresh = FREQ_THRESHOLD;  // default 49.0
-//static double localROCThreshold  = ROC_THRESHOLD;   // default 10.0
+static double freqThreshold = FREQ_THRESHOLD;  // default 49.0
+static double rocThreshold  = ROC_THRESHOLD;   // default 10.0
 
 /*
  * loadEnabled[i]  – user's switch intent: 1 = user wants load ON, 0 = user wants it OFF
@@ -65,13 +65,7 @@ static int loadShedByRelay[NUM_LOADS]; // 1 if relay has shed this load
 // Returns 1 if network is currently unstable
 static int isUnstable(double f, double roc)
 {
-
-	xSemaphoreTake(threshMutex, portMAX_DELAY);
-	double compare_Freq = FREQ_THRESHOLD;
-	double compare_ROC = ROC_THRESHOLD;
-	xSemaphoreGive(threshMutex);
-
-    return (f < compare_Freq) || (fabs(roc) > compare_ROC);
+    return (f < FREQ_THRESHOLD) || (fabs(roc) > ROC_THRESHOLD);
 }
 
 // Update physical LEDs from load state (call while holding loadMutex)
@@ -384,40 +378,35 @@ void vPS2Task(void *pvParameters)
         	printf("DEBUG: Task woke up with key: %c (0x%02x)\n", key, key);
             xSemaphoreTake(threshMutex, portMAX_DELAY);
 
-            double localFreqThresh = FREQ_THRESHOLD;
-            double localROCThresh = ROC_THRESHOLD;
-
             switch (key) {
                 case 'Q':
-                    localFreqThresh -= 0.5;
-                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
-                    if (localFreqThresh < 45.0) localFreqThresh = 45.0;
-                    printf("Max Threshold reached. Freq: %.1f Hz\n", localFreqThresh);
+                    freqThreshold -= 0.5;
+                    printf("Freq threshold: %.1f Hz\n", freqThreshold);
+                    if (freqThreshold < 45.0) freqThreshold = 45.0;
+                    printf("Max Threshold reached. Freq: %.1f Hz\n", freqThreshold);
                     break;
                 case 'A':
-                    localFreqThresh += 0.5;
-                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
-                    if (localFreqThresh > 52.0) localFreqThresh = 52.0;
-                    printf("Max Threshold reached. Freq: %.1f Hz\n", localFreqThresh);
+                    freqThreshold += 0.5;
+                    printf("Freq threshold: %.1f Hz\n", freqThreshold);
+                    if (freqThreshold > 52.0) freqThreshold = 52.0;
+                    printf("Max Threshold reached. Freq: %.1f Hz\n", freqThreshold);
                     break;
                 case 'W':
-                    localROCThresh -= 0.5;
-                    printf("roc threshold: %.1f Hz\n", localROCThresh);
-                    if (localROCThresh < 1.0) localROCThresh = 1.0;
-                    printf("Max Threshold reached. ROC: %.1f Hz/s\n", localROCThresh);
+                    rocThreshold -= 0.5;
+                    printf("roc threshold: %.1f Hz\n", rocThreshold);
+                    if (rocThreshold < 1.0) rocThreshold = 1.0;
+                    printf("Max Threshold reached. ROC: %.1f Hz/s\n", rocThreshold);
                     break;
                 case 'S':
-                    localROCThresh += 0.5;
-                    printf("roc threshold: %.1f Hz\n", localROCThresh);
-                    if (localROCThresh > 10.0) localROCThresh = 100.0;
-                    printf("Max Threshold reached. ROC: %.1f Hz/s\n", localROCThresh);
+                    rocThreshold += 0.5;
+                    printf("roc threshold: %.1f Hz\n", rocThreshold);
+                    if (rocThreshold > 10.0) rocThreshold = 100.0;
+                    printf("Max Threshold reached. ROC: %.1f Hz/s\n", rocThreshold);
                     break;
                 default:
                     break;
             }
             printf("Received key: %c\n", key);
-            FREQ_THRESHOLD = localFreqThresh;
-            ROC_THRESHOLD = localROCThresh;
             xSemaphoreGive(threshMutex);
         }
     }

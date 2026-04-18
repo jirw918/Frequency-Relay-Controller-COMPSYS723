@@ -67,8 +67,8 @@ static int isUnstable(double f, double roc)
 {
 
 	xSemaphoreTake(threshMutex, portMAX_DELAY);
-	double compare_Freq = FREQ_THRESHOLD;
-	double compare_ROC = ROC_THRESHOLD;
+	 double compare_Freq = FREQ_THRESHOLD;
+	 double compare_ROC = ROC_THRESHOLD;
 	xSemaphoreGive(threshMutex);
 
     return (f < compare_Freq) || (fabs(roc) > compare_ROC);
@@ -384,8 +384,8 @@ void vPS2Task(void *pvParameters)
         	printf("DEBUG: Task woke up with key: %c (0x%02x)\n", key, key);
             xSemaphoreTake(threshMutex, portMAX_DELAY);
 
-            double localFreqThresh = FREQ_THRESHOLD;
-            double localROCThresh = ROC_THRESHOLD;
+            static double localFreqThresh = FREQ_THRESHOLD;
+            static double localROCThresh = ROC_THRESHOLD;
 
             switch (key) {
                 case 'Q':
