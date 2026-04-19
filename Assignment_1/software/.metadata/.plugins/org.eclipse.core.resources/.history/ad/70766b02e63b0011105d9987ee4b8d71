@@ -229,7 +229,6 @@ void FrequencyAnalysisTask(void *pvParameters)
             // Forward frequency sample to VGA task (non-blocking; drop if full)
             xQueueSendToBack(vgaFreqQueue, &localFreq, 0);
 
-            // Change to Managing State if thresholds not met
             if (isUnstable(localFreq, localROC)) {
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
                 if (systemState == STATE_NORMAL) {
@@ -252,13 +251,10 @@ void vLoadControlTask(void *pvParameters)
 
         shedLowestPriorityLoad();
 
-        // Time when 1st load shed
         TickType_t periodStart = xTaskGetTickCount();
 
-        // Time between ISR -> 1st load shed
         double timeFirstShed = (double)(periodStart - instabilityDetectedTick) * portTICK_PERIOD_MS;
 
-        // For VGA
         xSemaphoreTake(timingMutex, portMAX_DELAY);
         timingCount++;
         if (timeFirstShed < timingMin) timingMin = timeFirstShed;
@@ -272,7 +268,6 @@ void vLoadControlTask(void *pvParameters)
 
         int lastUnstable = 1;
 
-        // Further Load Shedding/Regaining
         while (1) {
             vTaskDelay(pdMS_TO_TICKS(10));
 
@@ -388,27 +383,23 @@ void vPS2Task(void *pvParameters)
             switch (key) {
                 case 'Q':
                     localFreqThresh -= 0.5;
-                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
                     if (localFreqThresh < 45.0) localFreqThresh = 45.0;
-                    printf("Min threshold set to 45.0 to ensure graph visibility", localFreqThresh);
+                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
                     break;
                 case 'A':
                     localFreqThresh += 0.5;
-                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
                     if (localFreqThresh > 52.0) localFreqThresh = 52.0;
-                    printf("Max threshold set to 52.0 to ensure graph visibility", localFreqThresh);
+                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
                     break;
                 case 'W':
                     localROCThresh -= 0.5;
-                    printf("ROC threshold: %.1f Hz/s\n", localROCThresh);
                     if (localROCThresh < 1.0) localROCThresh = 1.0;
-                    printf("Minimum ROC threshold set to 1.0 for a cleaner graph", localROCThresh);
+                    printf("ROC threshold: %.1f Hz/s\n", localROCThresh);
                     break;
                 case 'S':
                     localROCThresh += 0.5;
+                    if (localROCThresh > 100.0) localROCThresh = 100.0;
                     printf("ROC threshold: %.1f Hz/s\n", localROCThresh);
-                    if (localROCThresh > 30.0) localROCThresh = 100.0;
-                    printf("Max ROC threshold set to 30 for a cleaner grahp", localROCThresh);
                     break;
                 default:
                     break;
@@ -453,11 +444,11 @@ void PRVGADraw_Task(void *pvParameters)
     alt_up_char_buffer_string(char_buf, "46",            10, 22);
 
     alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)",   4, 26);
-    alt_up_char_buffer_string(char_buf, "20",            10, 28);
-    alt_up_char_buffer_string(char_buf, "10",            10, 30);
+    alt_up_char_buffer_string(char_buf, "60",            10, 28);
+    alt_up_char_buffer_string(char_buf, "30",            10, 30);
     alt_up_char_buffer_string(char_buf, "0",             10, 32);
-    alt_up_char_buffer_string(char_buf, "-10",            9, 34);
-    alt_up_char_buffer_string(char_buf, "-20",            9, 36);
+    alt_up_char_buffer_string(char_buf, "-30",            9, 34);
+    alt_up_char_buffer_string(char_buf, "-60",            9, 36);
 
     // ---- Static dashboard labels (right panel, col 42) ----
     alt_up_char_buffer_string(char_buf, "=== LCFR Dashboard ===", 42,  1);
@@ -510,8 +501,8 @@ void PRVGADraw_Task(void *pvParameters)
                             * 2.0 * freqBuf[gi] * freqBuf[gi-1]
                             / (freqBuf[gi] + freqBuf[gi-1] + 1e-9);
 
-            if (dfreq[gi] >  10.0) dfreq[gi] =  10.0;
-            if (dfreq[gi] < -10.0) dfreq[gi] = -10.0;
+            if (dfreq[gi] >  100.0) dfreq[gi] =  100.0;
+            if (dfreq[gi] < -100.0) dfreq[gi] = -100.0;
 
             gi = (gi + 1) % 100;
         }

@@ -1,3 +1,8 @@
+// ============================================================
+//  Low-Cost Frequency Relay – main.c
+//  COMPSYS723  |  FreeRTOS on NIOS II / DE2-115
+// ============================================================
+
 // Standard includes
 #include <system.h>
 #include <stdio.h>
@@ -10,9 +15,10 @@
 #include "FreeRTOS/task.h"
 #include "FreeRTOS/queue.h"
 #include "FreeRTOS/semphr.h"
+#include "FreeRTOS/timers.h"
 #include "freertos/portmacro.h"
 
-// Altera includes
+// Altera / HAL includes
 #include "sys/alt_irq.h"
 #include "alt_types.h"
 #include "altera_avalon_pio_regs.h"
@@ -21,114 +27,165 @@
 #include "altera_up_avalon_ps2.h"
 #include "altera_up_ps2_keyboard.h"
 
-//For frequency plot
-#define FREQPLT_ORI_X 101		//x axis pixel position at the plot origin
-#define FREQPLT_GRID_SIZE_X 5	//pixel separation in the x axis between two data points
-#define FREQPLT_ORI_Y 199.0		//y axis pixel position at the plot origin
-#define FREQPLT_FREQ_RES 20.0	//number of pixels per Hz (y axis scale)
+// ============================================================
+//  Constants
+// ============================================================
+#define TASK_STACKSIZE   2048
+#define NUM_LOADS        5
+#define SAMPLING_FREQ    16000.0
 
-#define ROCPLT_ORI_X 101
-#define ROCPLT_GRID_SIZE_X 5
-#define ROCPLT_ORI_Y 259.0
-#define ROCPLT_ROC_RES 0.5
-
-#define MIN_FREQ 45.0
-
-#define TASK_STACKSIZE 2048
-#define NUM_LOADS      5
-
+// System states
 #define STATE_NORMAL      0
 #define STATE_MANAGING    1
 #define STATE_MAINTENANCE 2
 
-static double FREQ_THRESHOLD = 49.0;
-static double ROC_THRESHOLD  = 10;
+// VGA graph geometry  (same as provided skeleton)
+#define FREQPLT_ORI_X       101
+#define FREQPLT_GRID_SIZE_X   5
+#define FREQPLT_ORI_Y       199.0
+#define FREQPLT_FREQ_RES     20.0
+
+#define ROCPLT_ORI_X        101
+#define ROCPLT_GRID_SIZE_X    5
+#define ROCPLT_ORI_Y        259.0
+#define ROCPLT_ROC_RES        0.5
+
+#define MIN_FREQ  45.0
 
 // Reaction-time history kept for display
 #define MAX_TIMING_RECORDS  5
 
-// Globals
-static QueueHandle_t rawFreqData;
-static QueueHandle_t ps2Queue;
-static QueueHandle_t vgaFreqQueue;
+// ============================================================
+//  Configurable thresholds (protected by threshMutex)
+// ============================================================
+static double FREQ_THRESHOLD = 49.0;
+static double ROC_THRESHOLD  = 10.0;
 
-static SemaphoreHandle_t freqMutex;
-static SemaphoreHandle_t threshMutex;
-static SemaphoreHandle_t stateMutex;
-static SemaphoreHandle_t loadMutex;
-static SemaphoreHandle_t timingMutex;
-static SemaphoreHandle_t buttonSem;
-static SemaphoreHandle_t loadSem;
+// ============================================================
+//  FreeRTOS objects
+// ============================================================
+static QueueHandle_t   rawFreqData;   // ISR  -> FrequencyAnalysisTask  (unsigned int)
+static QueueHandle_t   vgaFreqQueue;  // FrequencyAnalysisTask -> VGA task (double)
+static QueueHandle_t   ps2Queue;      // PS2 ISR -> vPS2Task             (char)
 
-static double prevFreq   = 0.0;
-static double freq       = 0.0;
-static double ROC        = 0.0;
+static SemaphoreHandle_t freqMutex;   // protects freq / ROC globals
+static SemaphoreHandle_t threshMutex; // protects FREQ_THRESHOLD / ROC_THRESHOLD
+static SemaphoreHandle_t stateMutex;  // protects systemState
+static SemaphoreHandle_t loadMutex;   // protects load arrays + LEDs
+static SemaphoreHandle_t timingMutex; // protects timing records
+
+SemaphoreHandle_t buttonSem;          // button ISR -> vCheckButtonTask
+SemaphoreHandle_t loadSem;            // FrequencyAnalysisTask -> vLoadControlTask
+
+// ============================================================
+//  Shared state
+// ============================================================
+static double prevFreq    = 0.0;
+static double freq        = 0.0;
+static double ROC         = 0.0;
 volatile int  systemState = STATE_NORMAL;
 
 /*
- * loadEnabled[i]  – user's switch intent: 1 = user wants load ON, 0 = user wants it OFF
- * loadRelayOn[i]  – relay's decision:     1 = relay allows load ON, 0 = relay has shed it
+ * loadEnabled[i]   – user switch intent  (1 = user wants ON)
+ * loadRelayOn[i]   – relay permission    (1 = relay allows ON)
+ * loadShedByRelay[i] – relay has shed this load
  *
- * Actual load state = loadEnabled[i] && loadRelayOn[i]
- * Red  LED i = actual load ON
- * Green LED i = relay shed it (loadRelayOn[i]==0 while load was ON)
+ * Actual load state  = loadEnabled[i] && loadRelayOn[i]
+ * Red  LED i lit     = actual ON
+ * Green LED i lit    = relay shed it while user still wants it ON
  */
 static int loadEnabled[NUM_LOADS];
 static int loadRelayOn[NUM_LOADS];
 static int loadShedByRelay[NUM_LOADS];
 
-// To measure ISR -> 1st Load Shed
-static TickType_t instabilityDetectedTick = 0;
+// ============================================================
+//  Reaction-time measurement
+// ============================================================
+// We record TickType_t timestamps: instability detected (set in
+// FrequencyAnalysisTask) and first load shed (set in vLoadControlTask).
+static TickType_t instabilityDetectedTick = 0;   // set by FrequencyAnalysisTask
+static int        pendingTimingCapture    = 0;    // 1 = waiting for first shed tick
 
 // Ring buffer of the last MAX_TIMING_RECORDS reaction times (ms)
 static double timingRecords[MAX_TIMING_RECORDS];
-static int    timingCount  = 0;
-static int    timingHead   = 0;
+static int    timingCount  = 0;   // total captures so far (may exceed ring size)
+static int    timingHead   = 0;   // next write index in ring
 static double timingMin    = 1e9;
 static double timingMax    = 0.0;
-static double timingSum    = 0.0;
+static double timingSum    = 0.0; // sum of ALL samples (for a running average)
 
-// Helpers
-
-// Checks if current ROC, freq are below the threshold
-static int isUnstable(double f, double roc)
+// ============================================================
+//  Helper: record one reaction-time sample (call without loadMutex held)
+// ============================================================
+static void recordReactionTime(TickType_t detectedTick, TickType_t shedTick)
 {
-	xSemaphoreTake(threshMutex, portMAX_DELAY);
-	double compare_Freq = FREQ_THRESHOLD;
-	double compare_ROC = ROC_THRESHOLD;
-	xSemaphoreGive(threshMutex);
+    double ms = (double)(shedTick - detectedTick) * portTICK_PERIOD_MS;
 
-    return (f < compare_Freq) || (fabs(roc) > compare_ROC);
+    xSemaphoreTake(timingMutex, portMAX_DELAY);
+
+    timingRecords[timingHead] = ms;
+    timingHead = (timingHead + 1) % MAX_TIMING_RECORDS;
+    timingCount++;
+    timingSum += ms;
+    if (ms < timingMin) timingMin = ms;
+    if (ms > timingMax) timingMax = ms;
+
+    xSemaphoreGive(timingMutex);
+    printf("Reaction time: %.1f ms\n", ms);
 }
 
+// ============================================================
+//  Helper: isUnstable
+// ============================================================
+static int isUnstable(double f, double roc)
+{
+    xSemaphoreTake(threshMutex, portMAX_DELAY);
+    double cFreq = FREQ_THRESHOLD;
+    double cROC  = ROC_THRESHOLD;
+    xSemaphoreGive(threshMutex);
+    return (f < cFreq) || (fabs(roc) > cROC);
+}
+
+// ============================================================
+//  Helper: updateLEDs  (call while holding loadMutex)
+// ============================================================
 static void updateLEDs(void)
 {
     unsigned int redMask   = 0;
     unsigned int greenMask = 0;
-
     for (int i = 0; i < NUM_LOADS; i++) {
-        int actualOn = loadEnabled[i] && loadRelayOn[i];
-        if (actualOn) {
-            redMask |= (1 << i);
-        }
-        if (loadShedByRelay[i] && loadEnabled[i]) {
-            greenMask |= (1 << i);
-        }
+        if (loadEnabled[i] && loadRelayOn[i])
+            redMask |= (1u << i);
+        // Green: relay shed a load the user still wants ON
+        if (loadShedByRelay[i] && loadEnabled[i])
+            greenMask |= (1u << i);
     }
     IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE,   redMask);
     IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, greenMask);
 }
 
-// Sheds the lowest priority load and returns 1 to avoid shedding more . returns 0 if all load shed
+// ============================================================
+//  Helper: shedLowestPriorityLoad
+//  Returns 1 if a load was shed, 0 if nothing left.
+//  Also captures the reaction time on the FIRST shed of a
+//  managing cycle (when pendingTimingCapture == 1).
+// ============================================================
 static int shedLowestPriorityLoad(void)
 {
     xSemaphoreTake(loadMutex, portMAX_DELAY);
     for (int i = 0; i < NUM_LOADS; i++) {
         if (loadEnabled[i] && loadRelayOn[i]) {
-            loadRelayOn[i]    = 0;
+            loadRelayOn[i]     = 0;
             loadShedByRelay[i] = 1;
             updateLEDs();
             xSemaphoreGive(loadMutex);
+
+            // Capture reaction time for the first shed in this event
+            if (pendingTimingCapture) {
+                pendingTimingCapture = 0;
+                recordReactionTime(instabilityDetectedTick, xTaskGetTickCount());
+            }
+
             printf("Relay SHED load %d\n", i);
             return 1;
         }
@@ -137,12 +194,15 @@ static int shedLowestPriorityLoad(void)
     return 0;
 }
 
+// ============================================================
+//  Helper: reconnectHighestPriorityLoad
+// ============================================================
 static int reconnectHighestPriorityLoad(void)
 {
     xSemaphoreTake(loadMutex, portMAX_DELAY);
     for (int i = NUM_LOADS - 1; i >= 0; i--) {
         if (loadShedByRelay[i]) {
-            loadRelayOn[i]    = 1;
+            loadRelayOn[i]     = 1;
             loadShedByRelay[i] = 0;
             updateLEDs();
             xSemaphoreGive(loadMutex);
@@ -154,39 +214,32 @@ static int reconnectHighestPriorityLoad(void)
     return 0;
 }
 
-// Check if all loads are reconnected
 static int allLoadsReconnected(void)
 {
-    for (int i = 0; i < NUM_LOADS; i++) {
+    for (int i = 0; i < NUM_LOADS; i++)
         if (loadShedByRelay[i]) return 0;
-    }
     return 1;
 }
 
-// ISRs
+// ============================================================
+//  ISRs
+// ============================================================
 
-// When peak detected
 void FrequencyRelayISR(void* context, alt_u32 id)
 {
     unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
-
-    // Store the starting time when ISR occurs
-    instabilityDetectedTick = xTaskGetTickCountFromISR();
-
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendToBackFromISR(rawFreqData, &temp, &xHigherPriorityTaskWoken);
-    portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+    BaseType_t xHPTW = pdFALSE;
+    xQueueSendToBackFromISR(rawFreqData, &temp, &xHPTW);
+    portEND_SWITCHING_ISR(xHPTW);
 }
 
-// Check when the Button has been pressed
 void button_interrupts_function(void* context, alt_u32 id)
 {
     IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
     IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(buttonSem, &xHigherPriorityTaskWoken);
-    portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+    BaseType_t xHPTW = pdFALSE;
+    xSemaphoreGiveFromISR(buttonSem, &xHPTW);
+    portEND_SWITCHING_ISR(xHPTW);
 }
 
 void ps2_isr(void *context, alt_u32 id)
@@ -195,47 +248,50 @@ void ps2_isr(void *context, alt_u32 id)
     char ascii;
     unsigned char key = 0;
     KB_CODE_TYPE decode_mode;
-
     if (decode_scancode(ps2, &decode_mode, &key, &ascii) == 0) {
         if (decode_mode == KB_ASCII_MAKE_CODE) {
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            xQueueSendToBackFromISR(ps2Queue, &ascii, &xHigherPriorityTaskWoken);
-            portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+            BaseType_t xHPTW = pdFALSE;
+            xQueueSendToBackFromISR(ps2Queue, &ascii, &xHPTW);
+            portEND_SWITCHING_ISR(xHPTW);
         }
     }
 }
 
-// Tasks
-
-// Task 1 – Compute frequency & RoC, detect instability and change to managing state
+// ============================================================
+//  Task 1 – FrequencyAnalysisTask
+//  Computes freq & RoC, detects instability, feeds VGA queue.
+// ============================================================
 void FrequencyAnalysisTask(void *pvParameters)
 {
-    unsigned int rawFreqValue;
+    unsigned int rawVal;
     double localFreq, localROC;
 
     while (1) {
-        if (xQueueReceive(rawFreqData, &rawFreqValue, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(rawFreqData, &rawVal, portMAX_DELAY) == pdTRUE) {
 
-        	// Frequency/ROC calculation
-            localFreq = 16000.0 / (double)rawFreqValue;
-            localROC  = fabs((localFreq - prevFreq) * 16000.0 / (double)rawFreqValue);
+            localFreq = SAMPLING_FREQ / (double)rawVal;
+            localROC  = fabs((localFreq - prevFreq) * SAMPLING_FREQ / (double)rawVal);
             prevFreq  = localFreq;
 
+            // Update shared freq / ROC
             xSemaphoreTake(freqMutex, portMAX_DELAY);
             freq = localFreq;
             ROC  = localROC;
             xSemaphoreGive(freqMutex);
 
-            // Forward frequency sample to VGA task (non-blocking; drop if full)
+            // Feed VGA queue (non-blocking – drop if full; VGA is display only)
             xQueueSendToBack(vgaFreqQueue, &localFreq, 0);
 
-            // Change to Managing State if thresholds not met
+            // Instability check -> transition to STATE_MANAGING
             if (isUnstable(localFreq, localROC)) {
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
                 if (systemState == STATE_NORMAL) {
                     systemState = STATE_MANAGING;
+                    // Arm timing capture
+                    instabilityDetectedTick = xTaskGetTickCount();
+                    pendingTimingCapture    = 1;
                     xSemaphoreGive(stateMutex);
-                    xSemaphoreGive(loadSem);
+                    xSemaphoreGive(loadSem);   // wake load control task
                 } else {
                     xSemaphoreGive(stateMutex);
                 }
@@ -244,47 +300,34 @@ void FrequencyAnalysisTask(void *pvParameters)
     }
 }
 
-// Task 2 – Manage load shedding and reconnection
+// ============================================================
+//  Task 2 – vLoadControlTask
+//  Manages load shedding / reconnection with 500 ms windows.
+// ============================================================
 void vLoadControlTask(void *pvParameters)
 {
     while (1) {
         xSemaphoreTake(loadSem, portMAX_DELAY);
 
+        // First shed must happen within 200 ms – do it immediately
         shedLowestPriorityLoad();
 
-        // Time when 1st load shed
-        TickType_t periodStart = xTaskGetTickCount();
+        TickType_t periodStart  = xTaskGetTickCount();
+        int        lastUnstable = 1;
 
-        // Time between ISR -> 1st load shed
-        double timeFirstShed = (double)(periodStart - instabilityDetectedTick) * portTICK_PERIOD_MS;
-
-        // For VGA
-        xSemaphoreTake(timingMutex, portMAX_DELAY);
-        timingCount++;
-        if (timeFirstShed < timingMin) timingMin = timeFirstShed;
-        if (timeFirstShed > timingMax) timingMax = timeFirstShed;
-        timingSum += timeFirstShed;
-        timingRecords[timingHead] = timeFirstShed;
-        timingHead = (timingHead + 1) % MAX_TIMING_RECORDS;
-        xSemaphoreGive(timingMutex);
-
-        printf("Reaction time: %.1f ms\n", timeFirstShed);
-
-        int lastUnstable = 1;
-
-        // Further Load Shedding/Regaining
         while (1) {
             vTaskDelay(pdMS_TO_TICKS(10));
 
             xSemaphoreTake(freqMutex, portMAX_DELAY);
-            double localFreq = freq;
-            double localROC  = ROC;
+            double lFreq = freq;
+            double lROC  = ROC;
             xSemaphoreGive(freqMutex);
 
             xSemaphoreTake(stateMutex, portMAX_DELAY);
             int state = systemState;
             xSemaphoreGive(stateMutex);
 
+            // Maintenance overrides: release all shed loads
             if (state == STATE_MAINTENANCE) {
                 xSemaphoreTake(loadMutex, portMAX_DELAY);
                 for (int i = 0; i < NUM_LOADS; i++) {
@@ -296,7 +339,7 @@ void vLoadControlTask(void *pvParameters)
                 break;
             }
 
-            int nowUnstable = isUnstable(localFreq, localROC);
+            int nowUnstable = isUnstable(lFreq, lROC);
 
             if (nowUnstable != lastUnstable) {
                 periodStart  = xTaskGetTickCount();
@@ -307,10 +350,9 @@ void vLoadControlTask(void *pvParameters)
                 periodStart = xTaskGetTickCount();
 
                 if (nowUnstable) {
-                    if (!shedLowestPriorityLoad()) { /* all shed */ }
+                    shedLowestPriorityLoad();
                 } else {
                     reconnectHighestPriorityLoad();
-
                     if (allLoadsReconnected()) {
                         xSemaphoreTake(stateMutex, portMAX_DELAY);
                         systemState = STATE_NORMAL;
@@ -323,7 +365,9 @@ void vLoadControlTask(void *pvParameters)
     }
 }
 
-// Task 3 – Poll slide switches to update load enable state
+// ============================================================
+//  Task 3 – vSwitchPollTask  (20 Hz poll)
+// ============================================================
 void vSwitchPollTask(void *pvParameters)
 {
     while (1) {
@@ -336,8 +380,8 @@ void vSwitchPollTask(void *pvParameters)
         xSemaphoreTake(loadMutex, portMAX_DELAY);
         for (int i = 0; i < NUM_LOADS; i++) {
             int swOn = (sw >> i) & 1;
-
             if (state == STATE_MANAGING) {
+                // Can only turn OFF during managing
                 if (!swOn) loadEnabled[i] = 0;
             } else {
                 loadEnabled[i] = swOn;
@@ -354,7 +398,10 @@ void vSwitchPollTask(void *pvParameters)
     }
 }
 
-// Task 4 – Handle push button (toggle maintenance mode)
+// ============================================================
+//  Task 4 – vCheckButtonTask
+//  Toggles maintenance mode on button press.
+// ============================================================
 void vCheckButtonTask(void *pvParameters)
 {
     while (1) {
@@ -363,76 +410,82 @@ void vCheckButtonTask(void *pvParameters)
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         if (systemState == STATE_NORMAL) {
             systemState = STATE_MAINTENANCE;
-            printf("Entering MAINTENANCE mode\n");
+            printf("-> MAINTENANCE mode\n");
         } else if (systemState == STATE_MAINTENANCE) {
             systemState = STATE_NORMAL;
-            printf("Exiting MAINTENANCE mode\n");
+            printf("-> NORMAL mode\n");
         }
+        // Button press during STATE_MANAGING is intentionally ignored
         xSemaphoreGive(stateMutex);
     }
 }
 
-// Task 5 – Handle PS2 keyboard input to adjust thresholds
+// ============================================================
+//  Task 5 – vPS2Task
+//  Adjusts frequency / RoC thresholds via keyboard.
+//    Q / A  ->  freq threshold  -0.5 / +0.5  (range 45 – 52 Hz)
+//    W / S  ->  RoC  threshold  -0.5 / +0.5  (range  1 – 100 Hz/s)
+// ============================================================
 void vPS2Task(void *pvParameters)
 {
     char key;
     printf("PS2 task running\n");
     while (1) {
         if (xQueueReceive(ps2Queue, &key, portMAX_DELAY) == pdTRUE) {
-            printf("DEBUG: Task woke up with key: %c (0x%02x)\n", key, key);
             xSemaphoreTake(threshMutex, portMAX_DELAY);
 
-            double localFreqThresh = FREQ_THRESHOLD;
-            double localROCThresh  = ROC_THRESHOLD;
-
             switch (key) {
-                case 'Q':
-                    localFreqThresh -= 0.5;
-                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
-                    if (localFreqThresh < 45.0) localFreqThresh = 45.0;
-                    printf("Min threshold set to 45.0 to ensure graph visibility", localFreqThresh);
+                case 'Q': case 'q':
+                    FREQ_THRESHOLD -= 0.5;
+                    if (FREQ_THRESHOLD < 45.0) FREQ_THRESHOLD = 45.0;
+                    printf("Freq threshold: %.1f Hz\n", FREQ_THRESHOLD);
                     break;
-                case 'A':
-                    localFreqThresh += 0.5;
-                    printf("Freq threshold: %.1f Hz\n", localFreqThresh);
-                    if (localFreqThresh > 52.0) localFreqThresh = 52.0;
-                    printf("Max threshold set to 52.0 to ensure graph visibility", localFreqThresh);
+                case 'A': case 'a':
+                    FREQ_THRESHOLD += 0.5;
+                    if (FREQ_THRESHOLD > 52.0) FREQ_THRESHOLD = 52.0;
+                    printf("Freq threshold: %.1f Hz\n", FREQ_THRESHOLD);
                     break;
-                case 'W':
-                    localROCThresh -= 0.5;
-                    printf("ROC threshold: %.1f Hz/s\n", localROCThresh);
-                    if (localROCThresh < 1.0) localROCThresh = 1.0;
-                    printf("Minimum ROC threshold set to 1.0 for a cleaner graph", localROCThresh);
+                case 'W': case 'w':
+                    ROC_THRESHOLD -= 0.5;
+                    if (ROC_THRESHOLD < 1.0) ROC_THRESHOLD = 1.0;
+                    printf("ROC threshold: %.1f Hz/s\n", ROC_THRESHOLD);
                     break;
-                case 'S':
-                    localROCThresh += 0.5;
-                    printf("ROC threshold: %.1f Hz/s\n", localROCThresh);
-                    if (localROCThresh > 30.0) localROCThresh = 100.0;
-                    printf("Max ROC threshold set to 30 for a cleaner grahp", localROCThresh);
+                case 'S': case 's':
+                    ROC_THRESHOLD += 0.5;
+                    if (ROC_THRESHOLD > 100.0) ROC_THRESHOLD = 100.0;
+                    printf("ROC threshold: %.1f Hz/s\n", ROC_THRESHOLD);
                     break;
-                default:
-                    break;
+                default: break;
             }
 
-            FREQ_THRESHOLD = localFreqThresh;
-            ROC_THRESHOLD  = localROCThresh;
             xSemaphoreGive(threshMutex);
         }
     }
 }
 
-// Task 6 – VGA rendering (graphs + dashboard)
+// ============================================================
+//  Task 6 – PRVGADraw_Task
+//  Draws frequency & RoC graphs plus a text dashboard.
+//
+//  Layout (character grid, ~80 cols × 60 rows at 8-px chars):
+//    Row  0-3  : frequency graph (pixel region y 0-199)
+//    Row  4    : header labels (drawn once)
+//    Row 26-36 : RoC graph     (pixel region y 220-299)
+//    Row 38+   : text dashboard (right-hand side, col 42+)
+// ============================================================
 void PRVGADraw_Task(void *pvParameters)
 {
     // ---- Open VGA devices ----
-    alt_up_pixel_buffer_dma_dev *pixel_buf =
-        alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
-    if (pixel_buf == NULL) printf("can't find pixel buffer device\n");
+    alt_up_pixel_buffer_dma_dev *pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+    if(pixel_buf == NULL){
+		printf("can't find pixel buffer device\n");
+	}
     alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
 
-    alt_up_char_buffer_dev *char_buf =
-        alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
-    if (char_buf == NULL) printf("can't find char buffer device\n");
+    alt_up_char_buffer_dev *char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+	if(char_buf == NULL){
+		printf("can't find char buffer device\n");
+	}
     alt_up_char_buffer_clear(char_buf);
 
     // ---- Draw static graph axes ----
@@ -453,20 +506,22 @@ void PRVGADraw_Task(void *pvParameters)
     alt_up_char_buffer_string(char_buf, "46",            10, 22);
 
     alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)",   4, 26);
-    alt_up_char_buffer_string(char_buf, "20",            10, 28);
-    alt_up_char_buffer_string(char_buf, "10",            10, 30);
+    alt_up_char_buffer_string(char_buf, "60",            10, 28);
+    alt_up_char_buffer_string(char_buf, "30",            10, 30);
     alt_up_char_buffer_string(char_buf, "0",             10, 32);
-    alt_up_char_buffer_string(char_buf, "-10",            9, 34);
-    alt_up_char_buffer_string(char_buf, "-20",            9, 36);
+    alt_up_char_buffer_string(char_buf, "-30",            9, 34);
+    alt_up_char_buffer_string(char_buf, "-60",            9, 36);
 
     // ---- Static dashboard labels (right panel, col 42) ----
+    // These are drawn once; values are refreshed each loop iteration.
     alt_up_char_buffer_string(char_buf, "=== LCFR Dashboard ===", 42,  1);
     alt_up_char_buffer_string(char_buf, "Freq (Hz):",             42,  3);
     alt_up_char_buffer_string(char_buf, "RoC  (Hz/s):",           42,  4);
-    alt_up_char_buffer_string(char_buf, "Freq-Thresh:",           42,  5);
-    alt_up_char_buffer_string(char_buf, "ROC-Thresh:",            42,  6);
+    alt_up_char_buffer_string(char_buf, "Freq-Thresh:",              42,  5);
+    alt_up_char_buffer_string(char_buf, "ROC-Thresh:",              42,  6);
     alt_up_char_buffer_string(char_buf, "State:",                 42,  7);
-    alt_up_char_buffer_string(char_buf, "Loads (0 = lowest priority):", 42,  9);
+    alt_up_char_buffer_string(char_buf, "Loads (0 = lowest priority):",      42,  9);
+    // Load indicators – drawn once, values refreshed below
     for (int i = 0; i < NUM_LOADS; i++) {
         char lbl[8];
         snprintf(lbl, sizeof(lbl), "L%d:", i);
@@ -475,6 +530,7 @@ void PRVGADraw_Task(void *pvParameters)
     alt_up_char_buffer_string(char_buf, "Keys: Q/A=Freq W/S=ROC", 42, 16);
     alt_up_char_buffer_string(char_buf, "KEY2: Maintenance mode", 42, 17);
 
+    // Timing section labels
     alt_up_char_buffer_string(char_buf, "--- Reaction times (ms) ---", 42, 19);
     alt_up_char_buffer_string(char_buf, "Last 5:",                      42, 20);
     alt_up_char_buffer_string(char_buf, "Min:",                         42, 26);
@@ -487,7 +543,7 @@ void PRVGADraw_Task(void *pvParameters)
     double dfreq[100];
     memset(freqBuf, 0, sizeof(freqBuf));
     memset(dfreq,   0, sizeof(dfreq));
-    int gi = 99;
+    int gi = 99; // oldest-data index (ring)
 
     typedef struct { unsigned int x1,y1,x2,y2; } Line;
     Line lf, lr;
@@ -510,8 +566,8 @@ void PRVGADraw_Task(void *pvParameters)
                             * 2.0 * freqBuf[gi] * freqBuf[gi-1]
                             / (freqBuf[gi] + freqBuf[gi-1] + 1e-9);
 
-            if (dfreq[gi] >  10.0) dfreq[gi] =  10.0;
-            if (dfreq[gi] < -10.0) dfreq[gi] = -10.0;
+            if (dfreq[gi] >  100.0) dfreq[gi] =  100.0;
+            if (dfreq[gi] < -100.0) dfreq[gi] = -100.0;
 
             gi = (gi + 1) % 100;
         }
@@ -556,6 +612,7 @@ void PRVGADraw_Task(void *pvParameters)
         int dState = systemState;
         xSemaphoreGive(stateMutex);
 
+        // Load state snapshot
         int dEnabled[NUM_LOADS], dShed[NUM_LOADS];
         xSemaphoreTake(loadMutex, portMAX_DELAY);
         for (int i = 0; i < NUM_LOADS; i++) {
@@ -564,15 +621,15 @@ void PRVGADraw_Task(void *pvParameters)
         }
         xSemaphoreGive(loadMutex);
 
+        // Timing snapshot
         double tRecords[MAX_TIMING_RECORDS];
         double tMin, tMax, tAvg;
-        int    tCount, TtimingHead;
+        int    tCount;
         xSemaphoreTake(timingMutex, portMAX_DELAY);
         memcpy(tRecords, timingRecords, sizeof(timingRecords));
         tMin   = timingMin;
         tMax   = timingMax;
         tCount = timingCount;
-        TtimingHead = timingHead;
         tAvg   = (tCount > 0) ? timingSum / tCount : 0.0;
         xSemaphoreGive(timingMutex);
 
@@ -597,6 +654,7 @@ void PRVGADraw_Task(void *pvParameters)
                                           "MAINTENANCE ";
         alt_up_char_buffer_string(char_buf, stateStr, 55, 7);
 
+        // Load rows:  "ON " / "OFF" / "SHD" (shed by relay)
         for (int i = 0; i < NUM_LOADS; i++) {
             const char *ls =
                 dShed[i]    ? "SHD" :
@@ -605,8 +663,9 @@ void PRVGADraw_Task(void *pvParameters)
             alt_up_char_buffer_string(char_buf, ls, 46, 10 + i);
         }
 
+        // Reaction-time records (last 5, most-recent first)
         for (int r = 0; r < MAX_TIMING_RECORDS; r++) {
-            int idx = (TtimingHead - 1 - r + MAX_TIMING_RECORDS) % MAX_TIMING_RECORDS;
+            int idx = (timingHead - 1 - r + MAX_TIMING_RECORDS) % MAX_TIMING_RECORDS;
             int row = 21 + r;
             if (tCount > 0 && r < tCount) {
                 snprintf(buf, sizeof(buf), "  #%d: %6.1f ms", r + 1, tRecords[idx]);
@@ -626,6 +685,7 @@ void PRVGADraw_Task(void *pvParameters)
             alt_up_char_buffer_string(char_buf, "---    ", 47, 28);
         }
 
+        // Uptime
         double upSecs = (double)(xTaskGetTickCount() - startTick) * portTICK_PERIOD_MS / 1000.0;
         snprintf(buf, sizeof(buf), "%.1f s  ", upSecs);
         alt_up_char_buffer_string(char_buf, buf, 53, 30);
@@ -634,27 +694,31 @@ void PRVGADraw_Task(void *pvParameters)
     }
 }
 
-// Setup
-
+// ============================================================
+//  Setup
+// ============================================================
 void SetUpMisc(void)
 {
     for (int i = 0; i < NUM_LOADS; i++) {
-        loadEnabled[i]    = 0;
-        loadRelayOn[i]    = 1;
+        loadEnabled[i]     = 0;
+        loadRelayOn[i]     = 1;
         loadShedByRelay[i] = 0;
     }
+    for (int i = 0; i < MAX_TIMING_RECORDS; i++)
+        timingRecords[i] = 0.0;
+
     IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE,   0);
     IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
 
     rawFreqData  = xQueueCreate(5,   sizeof(unsigned int));
+    vgaFreqQueue = xQueueCreate(100, sizeof(double));
     ps2Queue     = xQueueCreate(16,  sizeof(char));
-    vgaFreqQueue = xQueueCreate(100, sizeof(double));  // holds up to 100 frequency samples
 
     freqMutex   = xSemaphoreCreateMutex();
     threshMutex = xSemaphoreCreateMutex();
     stateMutex  = xSemaphoreCreateMutex();
-    timingMutex = xSemaphoreCreateMutex();
     loadMutex   = xSemaphoreCreateMutex();
+    timingMutex = xSemaphoreCreateMutex();
     buttonSem   = xSemaphoreCreateBinary();
     loadSem     = xSemaphoreCreateBinary();
 }
@@ -668,7 +732,7 @@ void SetUpISRs(void)
     alt_irq_register(PUSH_BUTTON_IRQ, 0, button_interrupts_function);
 
     alt_up_ps2_dev *ps2 = alt_up_ps2_open_dev(PS2_NAME);
-    if (ps2 == NULL) {
+    if (!ps2) {
         printf("PS2 open failed\n");
     } else {
         alt_up_ps2_clear_fifo(ps2);
@@ -679,12 +743,13 @@ void SetUpISRs(void)
 
 void SetUpTasks(void)
 {
-    xTaskCreate(FrequencyAnalysisTask, "FreqAnalysis", TASK_STACKSIZE, NULL, 4, NULL);
-    xTaskCreate(vLoadControlTask,      "LoadControl",  TASK_STACKSIZE, NULL, 3, NULL);
+    // Higher number = higher priority in FreeRTOS
+    xTaskCreate(FrequencyAnalysisTask, "FreqAnalysis", TASK_STACKSIZE, NULL, 5, NULL);
+    xTaskCreate(vLoadControlTask,      "LoadControl",  TASK_STACKSIZE, NULL, 4, NULL);
     xTaskCreate(vSwitchPollTask,       "SwitchPoll",   TASK_STACKSIZE, NULL, 2, NULL);
-    xTaskCreate(vCheckButtonTask,      "ButtonCheck",  TASK_STACKSIZE, NULL, 2, NULL);
+    xTaskCreate(vCheckButtonTask,      "ButtonCheck",  TASK_STACKSIZE, NULL, 3, NULL);
     xTaskCreate(vPS2Task,              "PS2Task",      TASK_STACKSIZE, NULL, 2, NULL);
-    xTaskCreate(PRVGADraw_Task,        "VGADraw",      TASK_STACKSIZE, NULL, 1, NULL);  // lowest priority – display only
+    xTaskCreate(PRVGADraw_Task,        "VGADraw",      TASK_STACKSIZE, NULL, 1, NULL);
 
     vTaskStartScheduler();
 }
