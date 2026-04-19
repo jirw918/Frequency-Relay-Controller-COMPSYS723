@@ -554,7 +554,7 @@ void PRVGADraw_Task(void *pvParameters)
         tMin   = timingMin;
         tMax   = timingMax;
         tCount = timingCount;
-        TtimingHead = timingHead;
+        TtimingHead = timingHead
         tAvg   = (tCount > 0) ? timingSum / tCount : 0.0;
         xSemaphoreGive(timingMutex);
 
