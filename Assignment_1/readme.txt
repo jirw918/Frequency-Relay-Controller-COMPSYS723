@@ -93,6 +93,12 @@ Keep the Programmer open after configuration (do not close it).
 
 Open Nios II Eclipse.
 	Set the workspace directory to the project’s software subfolder.
+
+Rebuild BSP
+	right click project1.bsp, Nios II-> Generate BSP
+Rebuild Project
+	Select Project -> Build All (Ctrl + B)
+
 Open Run Configurations:
 	Select Nios II Hardware.
 	Verify the following:
