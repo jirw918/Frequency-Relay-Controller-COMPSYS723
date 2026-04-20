@@ -1,0 +1,95 @@
+	#include <stdio.h>
+	#include <unistd.h>
+
+	#include "system.h"
+	#include "sys/alt_irq.h"
+	#include "io.h"
+	#include "altera_avalon_pio_regs.h"
+
+	#include "freertos/FreeRTOS.h"
+	#include "freertos/queue.h"
+	#include "freertos/task.h"
+
+	// Task config
+	#define TASK_STACKSIZE 2048
+	#define FREQ_ANALYSER_PRIORITY 12
+
+	// Queue
+	#define ADC_QUEUE_SIZE 360
+	QueueHandle_t ADC_queue;
+
+	// Prototypes
+	void freqAnalyser(void *pvParameters);
+	void freqAnalyserISR(void* context, alt_u32 id);
+
+	// =========================
+	// ISR
+	// =========================
+	void freqAnalyserISR(void* context, alt_u32 id) {
+		unsigned int adc_count;
+
+		adc_count = IORD(FREQUENCY_ANALYSER_BASE, 0);
+
+		xQueueSendFromISR(ADC_queue, &adc_count, NULL);
+	}
+
+	// =========================
+	// TASK
+	// =========================
+	void freqAnalyser(void *pvParameters) {
+		unsigned int adc_count;
+
+		while (1) {
+			if (xQueueReceive(ADC_queue, &adc_count, portMAX_DELAY)) {
+				if (adc_count != 0) {
+					printf("%f Hz\n", 16000 / (double)adc_count);
+				}
+			}
+		}
+	}
+
+	// =========================
+	// INIT QUEUE
+	// =========================
+	int initOSDataStructs(void) {
+		ADC_queue = xQueueCreate(ADC_QUEUE_SIZE, sizeof(unsigned int));
+
+		if (ADC_queue == NULL) {
+			printf("Queue creation failed!\n");
+			while (1);
+		}
+
+		return 0;
+	}
+
+	// =========================
+	// INIT TASK
+	// =========================
+	int initCreateTask(void) {
+		if (xTaskCreate(freqAnalyser,
+						"freq_analyser",
+						TASK_STACKSIZE,
+						NULL,
+						FREQ_ANALYSER_PRIORITY,
+						NULL) != pdPASS) {
+			printf("Task creation failed!\n");
+			while (1);
+		}
+
+		return 0;
+	}
+
+	// =========================
+	// MAIN
+	// =========================
+	int main() {
+
+		initOSDataStructs();
+		initCreateTask();
+
+		alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freqAnalyserISR);
+
+		vTaskStartScheduler();
+
+		while (1);
+	}
