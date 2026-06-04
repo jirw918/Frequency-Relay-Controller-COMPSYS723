@@ -1,0 +1,101 @@
+
+% Cruise Control System - COMPSYS723 Assignment 2026
+% CruiseState encoding: 1=OFF, 2=ON, 3=STDBY, 4=DISABLE
+
+module CruiseControl:
+
+input On, Off, Resume, Set, QuickAccel, QuickDecel;
+input Accel  : float;
+input Brake  : float;
+input Speed  : float;
+
+output CruiseSpeed  : float;
+output ThrottleCmd  : float;
+output CruiseState  : integer;
+
+function regulateThrottle(boolean, float, float) : float;
+function isAccelPressed(float) : boolean;
+function isBrakePressed(float) : boolean;
+function isSpeedInRange(float) : boolean;
+function setCruiseSpeed(float) : float;
+function incrCruiseSpeed(float) : float;
+function decrCruiseSpeed(float) : float;
+
+var cruiseSpeedVar := 0.0 : float in
+signal IsGoingOn in
+
+emit CruiseState(1);
+emit CruiseSpeed(0.0);
+emit ThrottleCmd(0.0);
+
+loop
+    abort
+        loop
+            emit CruiseState(1);
+            emit CruiseSpeed(cruiseSpeedVar);
+            emit ThrottleCmd(?Accel);
+            pause
+        end loop
+    when immediate On;
+
+    cruiseSpeedVar := setCruiseSpeed(?Speed);
+    emit CruiseSpeed(cruiseSpeedVar);
+    emit IsGoingOn;
+
+    abort
+        loop
+            if isBrakePressed(?Brake) then
+                abort
+                    loop
+                        emit CruiseState(3);
+                        emit CruiseSpeed(cruiseSpeedVar);
+                        emit ThrottleCmd(0.0);
+                        pause
+                    end loop
+                when immediate Resume;
+                if isAccelPressed(?Accel) or not isSpeedInRange(?Speed) then
+                    emit CruiseState(4);
+                    emit CruiseSpeed(cruiseSpeedVar);
+                    emit ThrottleCmd(0.0);
+                else
+                    emit IsGoingOn;
+                    emit CruiseState(2);
+                    emit CruiseSpeed(cruiseSpeedVar);
+                    emit ThrottleCmd(regulateThrottle(true, cruiseSpeedVar, ?Speed));
+                end if
+            else
+                if isAccelPressed(?Accel) or not isSpeedInRange(?Speed) then
+                    emit CruiseState(4);
+                    emit CruiseSpeed(cruiseSpeedVar);
+                    emit ThrottleCmd(0.0);
+                else
+                    emit CruiseState(2);
+                    present Set then
+                        cruiseSpeedVar := setCruiseSpeed(?Speed);
+                    else
+                        present QuickAccel then
+                            cruiseSpeedVar := incrCruiseSpeed(cruiseSpeedVar);
+                        else
+                            present QuickDecel then
+                                cruiseSpeedVar := decrCruiseSpeed(cruiseSpeedVar);
+                            end present
+                        end present
+                    end present;
+                    emit CruiseSpeed(cruiseSpeedVar);
+                    present IsGoingOn then
+                        emit ThrottleCmd(regulateThrottle(true, cruiseSpeedVar, ?Speed));
+                    else
+                        emit ThrottleCmd(regulateThrottle(false, cruiseSpeedVar, ?Speed));
+                    end present
+                end if
+            end if;
+            pause
+        end loop
+    when immediate Off;
+
+end loop
+
+end signal
+end var
+
+end module
